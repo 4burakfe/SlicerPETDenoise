@@ -13,7 +13,7 @@ Then in the 3D Slicer go to Edit->Application Settings->Modules->Additional Modu
 Here click >> button and manually add SlicerPETDenoise, SlicerVolumeComparator and Easy_fusion folders.
 SlicerPETDenoise, SlicerVolumeComparator requires Pytorch to be installed to operate. You can install it from extension manager with Pytorch Utils extension.
 It is highly recommended to have CUDA capable GPU and if so be sure you have installed CUDA enabled version of Pytorch. Otherwise, it will work very very slow.
-You can train your own models with scripts provided here: https://github.com/4burakfe/Claritas
+You can train your own models with scripts provided here: https://github.com/4burakfe/Claritas This repository also contains pretrained models ready for use.
 You can test this module with the cases in here: https://github.com/4burakfe/SlicerPETDenoise_SampleCases
 
 ---
