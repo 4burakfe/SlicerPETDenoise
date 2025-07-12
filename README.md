@@ -113,7 +113,5 @@ This extension uses several Python libraries inside Slicer's environment:
 - `monai`
 - `einops`
 
-If not already installed, the modules will prompt to install them using pip.
-
-```bash
-pip install torch monai einops
+Torch must be installed with PyTorchUtils extension...
+If PyTorchUtils is not installed the modules will not appear.
