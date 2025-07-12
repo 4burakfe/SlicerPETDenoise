@@ -11,6 +11,7 @@
 
 
 SlicerPETDenoise is a 3D Slicer extension that includes three modules intended for medical image research, particularly PET and CT image workflows. These modules assist in denoising, comparing, and visually fusing volumetric medical data. The tools are developed with research utility in mind and are not intended for clinical use.
+
 This extension is not currently on Extension Manager of the 3D Slicer but can be installed manually.
 For installation download this repository and extract the zip folder. 
 Then in the 3D Slicer go to Edit->Application Settings->Modules->Additional Module Paths
@@ -19,9 +20,11 @@ Here click >> button and manually add SlicerPETDenoise, SlicerVolumeComparator a
 SlicerPETDenoise, SlicerVolumeComparator requires Pytorch to be installed to operate. 
 You can install it from extension manager with PyTorchUtils extension.
 If Pytorch Utils is not installed the modules will not be shown.
+
 It is highly recommended to have CUDA capable GPU and if so be sure you have installed CUDA enabled version of Pytorch. Otherwise, it will work very very slow.
 You can train your own models with scripts provided here: https://github.com/4burakfe/Claritas 
 This repository also contains pretrained models ready for use.
+
 You can test this module with the cases in here: https://github.com/4burakfe/SlicerPETDenoise_SampleCases
 
 ---
