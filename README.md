@@ -22,6 +22,8 @@ You can test this module with the cases in here: https://github.com/4burakfe/Sli
 
 ### 1. PET Denoise
 
+![Screenshot](scr1.jpg)
+
 #### Purpose
 Performs AI-based denoising of PET volumes using deep learning models. Supports UNET, SwinUNETR, and SwinUNETR+GCFN architectures.
 
@@ -47,6 +49,9 @@ Performs AI-based denoising of PET volumes using deep learning models. Supports 
 
 ### 2. Volume Comparator
 
+![Screenshot](scr2.jpg)
+
+
 #### Purpose
 Computes numerical differences between two volumes using several image similarity metrics.
 
@@ -68,6 +73,8 @@ Computes numerical differences between two volumes using several image similarit
 ---
 
 ### 3. EasyFusion
+
+![Screenshot](scr3.jpg)
 
 #### Purpose
 Provides basic image fusion for PET/SPECT and CT/MRI volumes. Includes tools for PET color mapping, CT windowing, and 3D view control.
