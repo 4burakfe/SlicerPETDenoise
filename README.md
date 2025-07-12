@@ -7,7 +7,7 @@
 ## Overview
 
 
-![Screenshot](SlicerPETDenoise\Resources\banner.png)
+![Screenshot](SlicerPETDenoise/Resources/banner.png)
 
 
 SlicerPETDenoise is a 3D Slicer extension that includes three modules intended for medical image research, particularly PET and CT image workflows. These modules assist in denoising, comparing, and visually fusing volumetric medical data. The tools are developed with research utility in mind and are not intended for clinical use.
