@@ -22,6 +22,7 @@ You can install it from extension manager with PyTorchUtils extension.
 If Pytorch Utils is not installed the modules will not be shown.
 
 It is highly recommended to have CUDA capable GPU and if so be sure you have installed CUDA enabled version of Pytorch. Otherwise, it will work very very slow.
+
 You can train your own models with scripts provided here: https://github.com/4burakfe/Claritas 
 This repository also contains pretrained models ready for use.
 
