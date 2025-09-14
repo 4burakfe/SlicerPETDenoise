@@ -4,13 +4,13 @@ project(SlicerPETDenoise)
 
 #-----------------------------------------------------------------------------
 # Extension meta-information
-set(EXTENSION_HOMEPAGE "https://www.slicer.org/wiki/Documentation/Nightly/Extensions/SlicerPETDenoise")
+set(EXTENSION_HOMEPAGE "https://github.com/4burakfe/SlicerPETDenoise/")
 set(EXTENSION_CATEGORY "Nuclear Medicine")
 set(EXTENSION_CONTRIBUTORS "Burak Demir")
-set(EXTENSION_DESCRIPTION "This extension uses UNET neural networks for denoising of PET images")
-set(EXTENSION_ICONURL "https://www.example.com/Slicer/Extensions/SlicerPETDenoise.png")
-set(EXTENSION_SCREENSHOTURLS "https://www.example.com/Slicer/Extensions/SlicerPETDenoise/Screenshots/1.png")
-set(EXTENSION_DEPENDS "NA") # Specified as a list or "NA" if no dependencies
+set(EXTENSION_DESCRIPTION "This extension uses UNET a SwinUNETR neural networks for denoising of PET images")
+set(EXTENSION_ICONURL "https://github.com/4burakfe/SlicerPETDenoise/blob/ed0f24892556718d029948076f1e4e8fae46c261/SlicerPETDenoise.png")
+set(EXTENSION_SCREENSHOTURLS "https://github.com/4burakfe/SlicerPETDenoise/blob/ed0f24892556718d029948076f1e4e8fae46c261/scr1.jpg")
+set(EXTENSION_DEPENDS "PyTorch") # Specified as a list or "NA" if no dependencies
 
 #-----------------------------------------------------------------------------
 # Extension dependencies
