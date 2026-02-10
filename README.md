@@ -11,6 +11,8 @@
 
 
 SlicerPETDenoise is a 3D Slicer extension that includes three modules intended for medical image research, particularly PET and CT image workflows. These modules assist in denoising, comparing, and visually fusing volumetric medical data. The tools are developed with research utility in mind and are not intended for clinical use.
+Related work: Demir, B., Atalay, M., Yurtcu, H. et al. Denoising of PET with SwinUNETR neural networks: impact of tumor oriented loss function, denoising module for 3D slicer. Ann Nucl Med (2026). https://doi.org/10.1007/s12149-026-02166-4
+
 
 This extension is not currently on Extension Manager of the 3D Slicer but can be installed manually.
 For installation download this repository and extract the zip folder. 
