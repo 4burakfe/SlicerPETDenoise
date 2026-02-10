@@ -231,6 +231,7 @@ class SlicerPETDenoiseWidget(ScriptedLoadableModuleWidget):
             "This module is NOT a medical device. Research use only.\n"
             "Developed by: Burak Demir, MD, FEBNM \n"
             "For support, questions and feedback: 4burakfe@gmail.com\n"
+            "Demir, B., Atalay, M., Yurtcu, H. et al. Denoising of PET with SwinUNETR neural networks: impact of tumor oriented loss function, denoising module for 3D slicer. Ann Nucl Med (2026). https://doi.org/10.1007/s12149-026-02166-4"
             "Version: v1.0"
         )
         infoTextBox.setToolTip("Module information and instructions.")  # Add a tooltip for additional help

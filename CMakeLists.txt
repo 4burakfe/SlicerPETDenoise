@@ -10,7 +10,7 @@ set(EXTENSION_CONTRIBUTORS "Burak Demir")
 set(EXTENSION_DESCRIPTION "This extension uses UNET a SwinUNETR neural networks for denoising of PET images")
 set(EXTENSION_ICONURL "https://github.com/4burakfe/SlicerPETDenoise/blob/ed0f24892556718d029948076f1e4e8fae46c261/SlicerPETDenoise.png")
 set(EXTENSION_SCREENSHOTURLS "https://github.com/4burakfe/SlicerPETDenoise/blob/ed0f24892556718d029948076f1e4e8fae46c261/scr1.jpg")
-set(EXTENSION_DEPENDS "PyTorch") # Specified as a list or "NA" if no dependencies
+set(EXTENSION_DEPENDS "PyTorchUtils") # Specified as a list or "NA" if no dependencies
 
 #-----------------------------------------------------------------------------
 # Extension dependencies
@@ -19,9 +19,9 @@ include(${Slicer_USE_FILE})
 
 #-----------------------------------------------------------------------------
 # Extension modules
-add_subdirectory(SlicerPETDenoise)
+add_subdirectory(PETDenoise)
 add_subdirectory(Easy_fusion)
-add_subdirectory(SlicerVolumeComparator)
+add_subdirectory(VolumeComparator)
 ## NEXT_MODULE
 
 #-----------------------------------------------------------------------------
