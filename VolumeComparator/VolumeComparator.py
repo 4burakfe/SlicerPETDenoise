@@ -10,7 +10,7 @@ import configparser
 
   
 
-class SlicerVolumeComparator(ScriptedLoadableModule):
+class VolumeComparator(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         parent.title = "Belenos - Volume Comparator"
@@ -28,7 +28,7 @@ class SlicerVolumeComparator(ScriptedLoadableModule):
         self.parent.icon = qt.QIcon(iconPath)  # Assign icon to the module
         self.parent = parent
 
-class SlicerVolumeComparatorWidget(ScriptedLoadableModuleWidget):
+class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)

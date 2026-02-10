@@ -10,7 +10,7 @@ import configparser
 
   
 
-class SlicerPETDenoise(ScriptedLoadableModule):
+class PETDenoise(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         parent.title = "Belenos - PET Denoise"
@@ -28,7 +28,7 @@ class SlicerPETDenoise(ScriptedLoadableModule):
         self.parent.icon = qt.QIcon(iconPath)  # Assign icon to the module
         self.parent = parent
 
-class SlicerPETDenoiseWidget(ScriptedLoadableModuleWidget):
+class PETDenoiseWidget(ScriptedLoadableModuleWidget):
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
