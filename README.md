@@ -17,7 +17,7 @@ Related work: Demir, B., Atalay, M., Yurtcu, H. et al. Denoising of PET with Swi
 This extension is not currently on Extension Manager of the 3D Slicer but can be installed manually.
 For installation download this repository and extract the zip folder. 
 Then in the 3D Slicer go to Edit->Application Settings->Modules->Additional Module Paths
-Here click >> button and manually add SlicerPETDenoise, SlicerVolumeComparator and Easy_fusion folders.
+Here click >> button and manually add PETDenoise, VolumeComparator and Easy_fusion folders.
 
 SlicerPETDenoise, SlicerVolumeComparator requires Pytorch to be installed to operate. 
 You can install it from extension manager with PyTorchUtils extension.
