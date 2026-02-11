@@ -112,9 +112,9 @@ Provides basic image fusion for PET/SPECT and CT/MRI volumes. Includes tools for
 
 1. Install [3D Slicer](https://www.slicer.org/)
 2. Clone or download this repository.
-3. Copy the folder into your Slicer's `Extensions` directory or develop via the **Developer Tools > Extension Wizard**.
-4. Restart Slicer.
-5. Modules will appear under the **Nuclear Medicine** category.
+3. This extension is not currently on Extension Manager of the 3D Slicer but can be installed manually. For installation download this repository and extract the zip folder. Then in the 3D Slicer go to Edit->Application Settings->Modules->Additional Module Paths Here click >> button and manually add PETDenoise, VolumeComparator and Easy_fusion folders.
+
+
 
 ---
 
