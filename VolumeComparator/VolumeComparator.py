@@ -90,6 +90,11 @@ class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
         self.ssimloss_range.setText("10")
         formLayout.addRow("Range for SSIM:", self.ssimloss_range)
 
+        self.ssimnorm_cbox = qt.QCheckBox()
+        formLayout.addRow("Auto Normalize Before SSIM: ", self.ssimnorm_cbox)
+
+
+
         # 5️⃣ Output Log Text Box
         self.outputTextBox = qt.QTextEdit()
         self.outputTextBox.setReadOnly(True)
@@ -203,19 +208,24 @@ class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
         self.outputTextBox.append(f"Input image size is: {inputTensor.shape[-3:]}")
         inputTensor2 = torch.tensor(inputImage2).float().unsqueeze(0).unsqueeze(0).to(device)  # Shape: (1, 1, D, H, W)
         self.outputTextBox.append(f"Secondary Input image size is: {inputTensor2.shape[-3:]}")
-
+        del inputImage
+        del inputImage2
         mse = F.mse_loss(inputTensor, inputTensor2)
-        inputTensor_clamped = torch.clamp(inputTensor, 0, float(self.ssimloss_range.text))
-        inputTensor2_clamped = torch.clamp(inputTensor2, 0, float(self.ssimloss_range.text))
-        ssim = SSIMLoss(spatial_dims=3, data_range=float(self.ssimloss_range.text))(inputTensor_clamped, inputTensor2_clamped)
-        l1 = F.l1_loss(inputTensor, inputTensor2)
-        edge = torch.nn.functional.l1_loss(gradient(inputTensor), gradient(inputTensor2))
-
         self.outputTextBox.append(f"Mean Squared Error is: {mse.item():.6f}")
+        del mse
+
+
+
+
+        l1 = F.l1_loss(inputTensor, inputTensor2)
         self.outputTextBox.append(f"Mean Absolute Error is: {l1.item():.6f}")
-        self.outputTextBox.append(f"Structural Similarity Index is: {(1-ssim.item()):.6f}")
-        self.outputTextBox.append(f"SSIM Loss (1-SSIM) is: {ssim.item():.6f}")
+        del l1
+
+
+
+        edge = torch.nn.functional.l1_loss(gradient(inputTensor), gradient(inputTensor2))
         self.outputTextBox.append(f"Edge Loss is: {edge.item():.6f}")
+        del edge
 
         def compute_psnr_dynamic(pred, target):
             mse = F.mse_loss(pred, target, reduction='mean').item()
@@ -226,7 +236,51 @@ class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
             return psnr.item()
 
         psnr = compute_psnr_dynamic(inputTensor, inputTensor2)
-        self.outputTextBox.append(f"Peak SNR is: {psnr:.6f}")
+        self.outputTextBox.append(f"Peak SNR is: {psnr:.6f}")        
+
+
+
+        if self.ssimnorm_cbox.checkState():
+
+            # 2. --- SSIM-Specific Normalization ---
+            # Define the clinical HU range you care about (e.g., Air to Dense Bone)
+            hu_min = inputTensor.min()
+            hu_max = inputTensor.max()
+            hu_min2 = inputTensor2.min()
+            hu_max2 = inputTensor2.max()
+            
+            if hu_min2 < hu_min:
+                hu_min = hu_min2
+
+            if hu_max2 > hu_max:
+                hu_max = hu_max2
+
+            # Clamp values to remove extreme outliers (like metal artifacts)
+            # This prevents the normalization range from being skewed.
+            inputTensor = torch.clamp(inputTensor, min=hu_min, max=hu_max)
+            inputTensor2 = torch.clamp(inputTensor2, min=hu_min, max=hu_max)
+        
+            # Min-Max normalize to a strict [0, 1] scale
+            inputTensor = (inputTensor - hu_min) / (hu_max - hu_min)
+            inputTensor2 = (inputTensor2 - hu_min) / (hu_max - hu_min)
+
+            # Calculate SSIM using the normalized tensors and a fixed data_range of 1.0
+            # (Note: We bypass self.ssim_datarange.get() here since we forced the range to [0, 1])
+            ssim = SSIMLoss(spatial_dims=3, data_range=1.0)(inputTensor, inputTensor2)
+
+        else:
+            inputTensor = torch.clamp(inputTensor, 0, float(self.ssimloss_range.text))
+            inputTensor2 = torch.clamp(inputTensor2, 0, float(self.ssimloss_range.text))
+            ssim = SSIMLoss(spatial_dims=3, data_range=float(self.ssimloss_range.text))(inputTensor, inputTensor2)
+
+
+
+        self.outputTextBox.append(f"Structural Similarity Index is: {(1-ssim.item()):.6f}")
+        self.outputTextBox.append(f"SSIM Loss (1-SSIM) is: {ssim.item():.6f}")
+        del ssim
+
+
+
         self.outputTextBox.append("Calculation has been completed, out.")
 
 
@@ -235,14 +289,7 @@ class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
 
         del inputTensor
         del inputTensor2
-        del inputImage
-        del inputImage2
-        del inputTensor_clamped
-        del inputTensor2_clamped
-        del mse
-        del ssim
-        del l1
-        del edge
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()

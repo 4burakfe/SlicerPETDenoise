@@ -76,7 +76,7 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
         self.inputVolumeSelector.showChildNodeTypes = False
         self.inputVolumeSelector.setMRMLScene(slicer.mrmlScene)
         self.inputVolumeSelector.setToolTip("Select the PET image for denoising.")
-        formLayout.addRow("Input PET Volume: ", self.inputVolumeSelector)
+        formLayout.addRow("Input Volume 1: ", self.inputVolumeSelector)
 
 
         # 1️⃣ Input Volume Selector (PET Image)
@@ -90,10 +90,15 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
         self.inputVolumeSelectorCT.showChildNodeTypes = False
         self.inputVolumeSelectorCT.setMRMLScene(slicer.mrmlScene)
         self.inputVolumeSelectorCT.setToolTip("Select the CT image for denoising.")
-        formLayout.addRow("Input CT Volume: ", self.inputVolumeSelectorCT)
+        formLayout.addRow("Input Volume 2: ", self.inputVolumeSelectorCT)
 
         self.dualch_cbox = qt.QCheckBox()
         formLayout.addRow("Dual Volume Input (PET+CT): ", self.dualch_cbox)
+
+        self.neg_val_cbox = qt.QCheckBox()
+        formLayout.addRow("Prevent Negative Values: ", self.neg_val_cbox)
+        self.neg_val_cbox.setChecked(True)
+
 
 
         # 📁 Select Model Folder Button and Display
@@ -126,6 +131,9 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
 
         formLayout.addRow("Model Info:", self.modelInfoBox)
         self.modelInfoBox.setPlainText("Select a model to display info.")
+
+        self.dont_resample_cbox = qt.QCheckBox()
+        formLayout.addRow("Do not Resample:", self.dont_resample_cbox)
 
 
         self.resample_voxel_size = qt.QLineEdit()
@@ -263,6 +271,16 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
                                 self.dualch_cbox.setChecked(True)
                             else:
                                 self.dualch_cbox.setChecked(False)
+                        elif key == "dont_resample":
+                            if value == "true":
+                                self.dont_resample_cbox.setChecked(True)
+                            else:
+                                self.dont_resample_cbox.setChecked(False)
+                        elif key == "prevent_negative":
+                            if value == "true":
+                                self.neg_val_cbox.setChecked(True)
+                            else:
+                                self.neg_val_cbox.setChecked(False)
                         elif key == "channels":
                             self.channels.setText(value)
                         elif key == "res_units":
@@ -283,6 +301,8 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
                             self.denoise_block_size.setText(value)
                         elif key == "voxel_spacing":
                             self.resample_voxel_size.setText(value)
+                            self.dont_resample_cbox.setChecked(False)
+
                         elif key == "architecture":
                             if value == "SwinUNETR":
                                 self.architecture.setCurrentIndex(1)
@@ -297,6 +317,16 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
         else:
             self.modelInfoBox.setPlainText("ℹ️ No description file found.")
 
+    def resample_volume(self, input_node, reference_node, output_node):
+        parameters = {
+            "inputVolume": input_node.GetID(),
+            "referenceVolume": reference_node.GetID(),
+            "outputVolume": output_node.GetID(),
+            "pixelType": "input",
+            "interpolationMode": "Linear"
+        }
+        slicer.cli.runSync(slicer.modules.brainsresample, None, parameters)
+        
 
 
     def onCalculateButtonClicked(self):
@@ -400,9 +430,11 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
             "outputPixelSpacing": eval(self.resample_voxel_size.text),  # ✅ Ensured correct format
             "interpolationType": "linear"
         }
-        resampleSuccess = slicer.cli.runSync(slicer.modules.resamplescalarvolume, None, resample_parameters)
-        inputImage = slicer.util.arrayFromVolume(outputVolumeNode)  # shape: [slices, height, width]
-
+        if self.dont_resample_cbox.checkState() == False:
+            resampleSuccess = slicer.cli.runSync(slicer.modules.resamplescalarvolume, None, resample_parameters)
+            inputImage = slicer.util.arrayFromVolume(outputVolumeNode)  # shape: [slices, height, width]
+        else:
+            inputImage = slicer.util.arrayFromVolume(inputVolumeNode)
 
 
         inputTensor = torch.tensor(inputImage).float().unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, D, H, W)
@@ -420,28 +452,16 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
             slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "ResampledCT")
             resampledCTNode = slicer.mrmlScene.GetFirstNodeByName("ResampledCT")
 
-
-            # Set parameters explicitly
-            parameters = {
-                "InputVolume": inputVolumeNodeCT.GetID(),
-                "OutputVolume": resampledCTNode.GetID(),
-                "interpolationType": "linear",
-                "outputPixelSpacing": outputVolumeNode.GetSpacing()
-            }
-            resampleSuccess = slicer.cli.runSync(slicer.modules.resamplescalarvolume, None, parameters)
-
-            if(resampleSuccess):
-                self.outputTextBox.append("✅ Resampling completed successfully.")
+            if self.dont_resample_cbox.checkState() == False:
+                self.resample_volume(inputVolumeNodeCT, outputVolumeNode, resampledCTNode)
             else:
-                self.outputTextBox.append("❌ Resampling failed.")
+                self.resample_volume(inputVolumeNodeCT, inputVolumeNode, resampledCTNode)
+
             ctImage = slicer.util.arrayFromVolume(resampledCTNode)
-            ctImage = np.clip(ctImage, -1000, 1000)
-            ctImage = (ctImage + 1000) * 0.005  # Normalize to 0–10
             pet_shape = inputImage.shape  # e.g., (128, 192, 192)
             ct_shape = ctImage.shape    # e.g., (126, 190, 190)
             target_shape = get_max_shape(pet_shape, ct_shape)
 
-        # Apply zero padding
 
 
         self.outputTextBox.append(f"Input image size is resized to: {target_shape}")
@@ -453,11 +473,7 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
             ctTensor = torch.tensor(ctImage).float().unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, D, H, W)
             self.outputTextBox.append(f"CT size: {ctTensor.shape[-3:]}")
             slicer.mrmlScene.RemoveNode(slicer.mrmlScene.GetFirstNodeByName("ResampledCT"))
-            paddedCT = center_pad_to_shape(ctTensor, target_shape)
-            paddedPET = center_pad_to_shape(inputTensor, target_shape)
-            self.outputTextBox.append(f"CT size after padding to match PET: {paddedCT.shape[-3:]}")
-
-            combinedTensor=torch.cat([paddedPET, paddedCT], dim=1)
+            combinedTensor=torch.cat([inputTensor, ctTensor], dim=1)
             with torch.no_grad():
                 device = next(model.parameters()).device
                 combinedTensor = combinedTensor.to(device)
@@ -469,22 +485,24 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
                     overlap=0.25,
                     mode="gaussian"
                 )
-            paddedPET = paddedPET.to(device)
-            outputTensor = paddedPET - predicted_noise
+            inputTensor = inputTensor.to(device)
+            outputTensor = inputTensor - predicted_noise
             self.outputTextBox.append(f"Denoising is done! Output image size: {outputTensor.shape[-3:]}")
             outputTensor = outputTensor[:, :, :current_shape[0], :current_shape[1], :current_shape[2]]
             elapsed = time.time() - start_time  # ⏱️ End timer
             self.outputTextBox.append(f"⏱️ Inference time: {elapsed:.2f} seconds")  # ✅ Log time
             outputArray = outputTensor.squeeze().cpu().numpy()
-            outputArray = np.clip(outputArray, 0, None)  # remove negative values
+
+
+
+            if self.neg_val_cbox.checkState():
+                outputArray = np.clip(outputArray, 0, None)  # remove negative values
             outputArray = outputArray.astype(inputImage.dtype)  # match original type
             self.outputTextBox.append(f"Output image size is resized to: {outputArray.shape}")
 
             slicer.util.updateVolumeFromArray(outputVolumeNode, outputArray)
             self.outputTextBox.append(f"Output image name is named as: {outputVolumeNode.GetName()}")
             del model
-            del paddedPET
-            del paddedCT
             del outputArray
             del outputTensor
             del ctTensor
@@ -513,7 +531,8 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
             elapsed = time.time() - start_time  # ⏱️ End timer
             self.outputTextBox.append(f"⏱️ Inference time: {elapsed:.2f} seconds")  # ✅ Log time
             outputArray = outputTensor.squeeze().cpu().numpy()
-            outputArray = np.clip(outputArray, 0, None)  # remove negative values
+            if self.neg_val_cbox.checkState():
+                outputArray = np.clip(outputArray, 0, None)  # remove negative values
             outputArray = outputArray.astype(inputImage.dtype)  # match original type
             self.outputTextBox.append(f"Output image size is resized to: {outputArray.shape}")
 
