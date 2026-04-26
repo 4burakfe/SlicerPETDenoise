@@ -212,20 +212,17 @@ class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
         del inputImage2
         mse = F.mse_loss(inputTensor, inputTensor2)
         self.outputTextBox.append(f"Mean Squared Error is: {mse.item():.6f}")
-        del mse
 
 
 
 
         l1 = F.l1_loss(inputTensor, inputTensor2)
         self.outputTextBox.append(f"Mean Absolute Error is: {l1.item():.6f}")
-        del l1
 
 
 
         edge = torch.nn.functional.l1_loss(gradient(inputTensor), gradient(inputTensor2))
         self.outputTextBox.append(f"Edge Loss is: {edge.item():.6f}")
-        del edge
 
         def compute_psnr_dynamic(pred, target):
             mse = F.mse_loss(pred, target, reduction='mean').item()
@@ -277,6 +274,11 @@ class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
 
         self.outputTextBox.append(f"Structural Similarity Index is: {(1-ssim.item()):.6f}")
         self.outputTextBox.append(f"SSIM Loss (1-SSIM) is: {ssim.item():.6f}")
+        self.outputTextBox.append(f"{mse.item():.6f};{l1.item():.6f};{(1-ssim.item()):.6f};{ssim.item():.6f};{psnr:.6f}")
+
+        del mse
+        del l1
+        del edge
         del ssim
 
 
