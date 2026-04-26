@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-set(MODULE_NAME SlicerVolumeComparator)
+set(MODULE_NAME VolumeComparator)
 
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
