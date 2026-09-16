@@ -1,5 +1,7 @@
 import os
 import re
+import random
+import colorsys
 import logging
 
 import numpy as np
@@ -32,9 +34,9 @@ DEFAULT_ROI_RADIUS_MM = 15.0
 ROI_SEGMENTATION_ATTRIBUTE = "EasyFusion.SUVROISegmentation"
 ROI_SEGMENTATION_PET_ROLE = "EasyFusionSegmentationPET"
 ROI_SEGMENT_ID_PREFIX = "EFROI_"
-ROI_SEGMENT_COLOR = (0.0, 0.85, 1.0)
+ROI_COLOR_ATTRIBUTE = "EasyFusion.RoiColor_"       # + control point ID, "r g b" (0..1)
 ROI_SEGMENT_OUTLINE_PX = 2
-THRESHOLD_RELATIVE = "relative"   # % of the ROI's SUVmax
+THRESHOLD_RELATIVE = "relative"   # % of the ROI's Max
 THRESHOLD_ABSOLUTE = "absolute"   # fixed SUV value
 DEFAULT_RELATIVE_THRESHOLD = 40.0
 DEFAULT_ABSOLUTE_THRESHOLD = 2.5
@@ -44,8 +46,20 @@ SETTINGS_ABSOLUTE_THRESHOLD = "EasyFusion.AbsoluteThreshold"
 
 # ROI appearance
 ROI_SPHERE_OUTLINE_PX = 1
+ROI_SPHERE_COLOR_ARRAY = "EasyFusionRoiColor"
 ROI_HANDLE_GLYPH_SCALE = 1.4
 ROI_LABEL_TEXT_SCALE = 2.5
+
+# ROIs projected onto the MIP (3D view). The MIP is fully opaque, so segments and labels are drawn in an
+# overlay render layer that shares the 3D camera and is always on top (like a PET workstation MIP overlay).
+# 3D segment surfaces follow the voxels exactly (no smoothing), so they match the measured MTV
+SEGMENT_SURFACE_SMOOTHING = "0.0"
+MIP_OVERLAY_SEGMENT_OPACITY = 0.65
+MIP_OVERLAY_TEXT_COLOR = (0.05, 0.05, 0.05)
+MIP_OVERLAY_TEXT_BACKGROUND = (1.0, 1.0, 1.0)
+MIP_OVERLAY_TEXT_BACKGROUND_OPACITY = 0.75
+MIP_OVERLAY_FONT_SIZE = 14
+MIP_OVERLAY_TEXT_OFFSET_PX = (14, 10)
 
 # SUV text is drawn by a separate, locked label layer so it can be white and sit one radius
 # away from the center. One anchor per ROI lies in only one of the three standard planes, on the
@@ -60,6 +74,37 @@ HANDLE_DIRECTIONS = [(1.0, 0.0, 0.0), (-1.0, 0.0, 0.0),
                      (0.0, 0.0, 1.0), (0.0, 0.0, -1.0)]
 
 # ---------------------------------------------------------------------------
+# Window / level presets
+# ---------------------------------------------------------------------------
+
+# (button text, window, level in Hounsfield units, shortcut key over CT-only views)
+CT_WINDOW_PRESETS = [
+    ("CT: Abdomen", 400, 50, "F5"),
+    ("CT: Head", 80, 40, "F6"),
+    ("CT: Lungs", 1500, -600, "F7"),
+    ("CT: Bones", 1800, 400, "F8"),
+]
+# Fixed SUV ranges starting at 0 (button text, upper SUV, shortcut key over fusion / PET-only / 3D views)
+PET_SUV_PRESETS = [
+    ("0–5", 5.0, "F5"),
+    ("0–7", 7.0, "F6"),
+    ("0–10", 10.0, "F7"),
+    ("0–15", 15.0, "F8"),
+    ("0–25", 25.0, "F9"),
+]
+WINDOW_SHORTCUT_KEYS = ["F5", "F6", "F7", "F8", "F9"]
+# SPECT (or any uncalibrated image): 0 .. percent of the maximum count in the volume
+SPECT_PERCENT_OF_MAX_PRESETS = [10, 25, 50, 75, 100]
+
+# (button text, color node name); PET-DICOM and Hot Metal Blue on the second row
+PET_COLOR_MAP_BUTTONS = [
+    [("Hot Iron", HOT_IRON_NAME), ("Inferno", "Inferno"), ("Rainbow-2", "PET-Rainbow2")],
+    [("PET-DICOM", "PET-DICOM"), ("Red", "Red"), ("Hot Metal Blue", "PET-HotMetalBlue")],
+]
+# Color map combo box (applied by "Go")
+FUSION_COLOR_MAPS = {"Hot Iron": HOT_IRON_NAME, "Inferno": "Inferno", "Rainbow": "PET-Rainbow2"}
+
+# ---------------------------------------------------------------------------
 # Layouts
 # ---------------------------------------------------------------------------
 
@@ -67,7 +112,10 @@ LAYOUT_FOUR_UP_ID = 3              # Slicer's built-in four-up (vtkMRMLLayoutNod
 LAYOUT_AXIAL_FOUR_UP_ID = 7501
 LAYOUT_TWO_BY_THREE_ID = 7502
 LAYOUT_DUAL_MONITOR_ID = 7503
-CUSTOM_LAYOUT_IDS = (LAYOUT_AXIAL_FOUR_UP_ID, LAYOUT_TWO_BY_THREE_ID, LAYOUT_DUAL_MONITOR_ID)
+LAYOUT_CT_FUSION_PET_3D_ID = 7504          # full 2x3 (CT | fusion | PET) + 3D
+LAYOUT_DUAL_MONITOR_FUSION_MIDDLE_ID = 7505
+DUAL_MONITOR_LAYOUT_IDS = (LAYOUT_DUAL_MONITOR_ID, LAYOUT_DUAL_MONITOR_FUSION_MIDDLE_ID)
+CUSTOM_LAYOUT_IDS = (LAYOUT_AXIAL_FOUR_UP_ID, LAYOUT_TWO_BY_THREE_ID, LAYOUT_CT_FUSION_PET_3D_ID) + DUAL_MONITOR_LAYOUT_IDS
 DUAL_MONITOR_WINDOW_TITLE = "EasyFusion - Monitor 2"
 
 # Slice view name -> (orientation, content). Content: fusion = CT + PET overlay,
@@ -98,6 +146,10 @@ SETTINGS_PET_ROLE = "EasyFusionPET"
 SETTINGS_CT_ROLE = "EasyFusionCT"
 PET_ONLY_VOLUME_ATTRIBUTE = "EasyFusion.PETOnlyDisplayVolume"
 PET_ONLY_SOURCE_ROLE = "EasyFusionSourcePET"
+# Fixed IDs for the unsaved twin. An auto-numbered ID (e.g. vtkMRMLScalarVolumeNode3) can be handed to a
+# completely different volume in the next scene; these can only ever belong to the twin.
+PET_ONLY_VOLUME_ID = "vtkMRMLScalarVolumeNodeEasyFusionPETOnly"
+PET_ONLY_DISPLAY_ID = "vtkMRMLScalarVolumeDisplayNodeEasyFusionPETOnly"
 
 
 def _sliceViewItem(name):
@@ -119,38 +171,57 @@ def _nested(layoutType, items):
     return f'<item><layout type="{layoutType}">' + "".join(items) + '</layout></item>'
 
 
-def buildLayoutDescriptions():
-    """Layout XML for the custom EasyFusion layouts, keyed by layout ID."""
-    axialFourUp = (
-        '<layout type="vertical">'
-        + _nested("horizontal", [_sliceViewItem("Red"), _THREED_VIEW_ITEM])
-        + _nested("horizontal", [_sliceViewItem("EFAxialCT"), _sliceViewItem("EFAxialPET")])
-        + '</layout>')
+def _sliceViews(*names):
+    return [_sliceViewItem(name) for name in names]
 
-    # 3 columns: [axial fusion / sagittal fusion] [axial CT / sagittal CT] [3D spanning both rows]
-    twoByThree = (
-        '<layout type="horizontal">'
-        + _nested("vertical", [_sliceViewItem("Red"), _sliceViewItem("Yellow")])
-        + _nested("vertical", [_sliceViewItem("EFAxialCT"), _sliceViewItem("EFSagittalCT")])
-        + _THREED_VIEW_ITEM
-        + '</layout>')
 
-    # Main window: 3x2 axial/sagittal grid. Second window (drag or auto-placed on monitor 2): 3D + coronal.
-    dualMonitor = (
+def _dualMonitorLayout(axialRow, sagittalRow):
+    """Main window: axial row over sagittal row. Second window (auto-placed on monitor 2): 3D + coronal."""
+    return (
         '<viewports>'
         '<layout type="vertical">'
-        + _nested("horizontal", [_sliceViewItem("Red"), _sliceViewItem("EFAxialCT"), _sliceViewItem("EFAxialPET")])
-        + _nested("horizontal", [_sliceViewItem("Yellow"), _sliceViewItem("EFSagittalCT"), _sliceViewItem("EFSagittalPET")])
+        + _nested("horizontal", _sliceViews(*axialRow))
+        + _nested("horizontal", _sliceViews(*sagittalRow))
         + '</layout>'
         f'<layout name="EasyFusionMonitor2" type="horizontal" label="{DUAL_MONITOR_WINDOW_TITLE}" dockable="false">'
         + _THREED_VIEW_ITEM + _sliceViewItem("Green") + _sliceViewItem("EFCoronalCT")
         + '</layout>'
         '</viewports>')
 
+
+def buildLayoutDescriptions():
+    """Layout XML for the custom EasyFusion layouts, keyed by layout ID."""
+    axialFourUp = (
+        '<layout type="vertical">'
+        + _nested("horizontal", [_sliceViewItem("Red"), _THREED_VIEW_ITEM])
+        + _nested("horizontal", _sliceViews("EFAxialCT", "EFAxialPET"))
+        + '</layout>')
+
+    # 3 columns: [axial fusion / sagittal fusion] [axial CT / sagittal CT] [3D spanning both rows]
+    twoByThree = (
+        '<layout type="horizontal">'
+        + _nested("vertical", _sliceViews("Red", "Yellow"))
+        + _nested("vertical", _sliceViews("EFAxialCT", "EFSagittalCT"))
+        + _THREED_VIEW_ITEM
+        + '</layout>')
+
+    # 4 columns: [axial CT / sagittal CT] [axial fusion / sagittal fusion] [axial PET / sagittal PET] [3D]
+    ctFusionPet3D = (
+        '<layout type="horizontal">'
+        + _nested("vertical", _sliceViews("EFAxialCT", "EFSagittalCT"))
+        + _nested("vertical", _sliceViews("Red", "Yellow"))
+        + _nested("vertical", _sliceViews("EFAxialPET", "EFSagittalPET"))
+        + _THREED_VIEW_ITEM
+        + '</layout>')
+
     return {
         LAYOUT_AXIAL_FOUR_UP_ID: axialFourUp,
         LAYOUT_TWO_BY_THREE_ID: twoByThree,
-        LAYOUT_DUAL_MONITOR_ID: dualMonitor,
+        LAYOUT_DUAL_MONITOR_ID: _dualMonitorLayout(
+            ("Red", "EFAxialCT", "EFAxialPET"), ("Yellow", "EFSagittalCT", "EFSagittalPET")),
+        LAYOUT_CT_FUSION_PET_3D_ID: ctFusionPet3D,
+        LAYOUT_DUAL_MONITOR_FUSION_MIDDLE_ID: _dualMonitorLayout(
+            ("EFAxialCT", "Red", "EFAxialPET"), ("EFSagittalCT", "Yellow", "EFSagittalPET")),
     }
 
 
@@ -165,27 +236,28 @@ def fieldOfViewForTarget(sourceFieldOfView, targetDimensions):
 class Easy_fusion(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
-        parent.title = "Lvgvs - PET/CT Review"
+        parent.title = "Lvgvs - SPECT/PET Review"
         parent.categories = ["Nuclear Medicine"]
         parent.dependencies = []
         parent.contributors = ["Burak Demir, MD, FEBNM"]
         parent.helpText = """
         This module provides easy fusion of SPECT/PET and CT/MR images.
-        Spherical ROIs report SUVmax and SUVmean, plus a thresholded segment inside each ROI
-        (default 40% of SUVmax, or an absolute SUV) giving segment SUVmean, MTV and TLG. Values are read
+        Spherical ROIs report Max and Mean, plus a thresholded segment inside each ROI
+        (default 40% of Max, or an absolute SUV) giving segment Mean, MTV and TLG.
+        The label next to each ROI in the views shows Max and the segment Mean. Values are read
         directly from the selected PET volume
         (the volume is assumed to already be in SUV units). Press Insert over a slice view to drop
         an ROI at the cursor; drag the yellow edge handles to resize it.
-        Layout buttons switch between four-up, axial fusion/CT/PET, 2x3 + 3D and a dual monitor layout
-        (the dual monitor layout needs Slicer 5.2 or later).
+        PET presets set a fixed SUV range; SPECT presets set 0 to a percentage of the maximum count in the image.
+        Keyboard windowing with the mouse over a view: F5-F8 = abdomen, head, lungs, bones on CT views;
+        F5-F9 = SUV 0-5, 0-7, 0-10, 0-15, 0-25 on fusion, PET and 3D views.
+        Layout buttons switch between four-up, axial fusion/CT/PET, 2x3 + 3D, CT | fusion | PET + 3D and two
+        dual monitor layouts (the dual monitor layouts need Slicer 5.2 or later).
         """
         parent.acknowledgementText = """
         This file was developed by Burak Demir.
         """
-        # **✅ Set the module icon**
-        iconPath = os.path.join(os.path.dirname(__file__), "Resources\\Icons\\Easy_fusion.png")
-        self.parent.icon = qt.QIcon(iconPath)  # Assign icon to the module
-        self.parent = parent
+        parent.icon = qt.QIcon(os.path.join(os.path.dirname(__file__), "Resources", "Icons", "Easy_fusion.png"))
 
         # Scene-load fixes (Hot Iron repair, no auto-rotation) must work even if the
         # EasyFusion GUI has not been opened yet in this Slicer session.
@@ -198,6 +270,12 @@ class Easy_fusion(ScriptedLoadableModule):
 
 _sceneObserverTags = []
 
+# Scene / layout work is never done inside a scene notification. It runs from the event loop once the
+# scene has been idle for a short while, so the layout manager has finished rebuilding its views.
+SCENE_POLL_MS = 100
+SCENE_SETTLE_MS = 300
+SCENE_MAX_WAIT_MS = 10 * 60 * 1000
+
 
 def registerSceneObservers():
     """
@@ -208,10 +286,15 @@ def registerSceneObservers():
     if _sceneObserverTags:
         return
     scene = slicer.mrmlScene
-    _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.StartCloseEvent, _onSceneStartClose))
-    _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.EndImportEvent, _onSceneEndImport))
-    _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.StartSaveEvent, _onSceneStartSave))
-    _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.EndSaveEvent, _onSceneEndSave))
+    for eventName, handler in (("StartCloseEvent", _onSceneStartClose),
+                               ("EndImportEvent", _onSceneEndImport),
+                               ("StartSaveEvent", _onSceneStartSave),
+                               ("EndSaveEvent", _onSceneEndSave)):
+        event = getattr(slicer.vtkMRMLScene, eventName, None)
+        if event is None:
+            logging.warning(f"EasyFusion: this Slicer has no vtkMRMLScene.{eventName}")
+            continue
+        _sceneObserverTags.append(scene.AddObserver(event, handler))
     try:
         Easy_fusionLogic.ensureLayoutsRegistered()
         Easy_fusionLogic.reapplyRestoredCustomLayout()
@@ -224,15 +307,37 @@ def sceneIsBusy():
     return scene.IsImporting() or scene.IsClosing() or scene.IsBatchProcessing()
 
 
-def callWhenSceneIdle(callback, attemptsLeft=50):
-    """Run callback from the event loop once the scene has finished loading/closing (views are rebuilt by then)."""
-    if sceneIsBusy() and attemptsLeft > 0:
-        qt.QTimer.singleShot(100, lambda: callWhenSceneIdle(callback, attemptsLeft - 1))
-        return
-    try:
-        callback()
-    except Exception:
-        logging.exception("EasyFusion: deferred scene update failed")
+def runWhenSceneSettled(callback, settleMs=SCENE_SETTLE_MS):
+    """
+    Run callback from the event loop once the scene has been idle for settleMs.
+    Never runs while the scene is still loading / closing: if it stays busy too long, the callback is dropped.
+    """
+    state = {"elapsed": 0, "idleSince": None}
+
+    def poll():
+        if sceneIsBusy():
+            state["idleSince"] = None
+            if state["elapsed"] >= SCENE_MAX_WAIT_MS:
+                logging.warning("EasyFusion: scene stayed busy, skipped a deferred update")
+                return
+        else:
+            if state["idleSince"] is None:
+                state["idleSince"] = state["elapsed"]
+            if state["elapsed"] - state["idleSince"] >= settleMs:
+                try:
+                    callback()
+                except Exception:
+                    logging.exception("EasyFusion: deferred scene update failed")
+                return
+        state["elapsed"] += SCENE_POLL_MS
+        qt.QTimer.singleShot(SCENE_POLL_MS, poll)
+
+    qt.QTimer.singleShot(0, poll)
+
+
+def deferUntilSceneIdle(callback):
+    """Leave the current scene/layout notification first, then run callback when the scene is idle."""
+    runWhenSceneSettled(callback, settleMs=0)
 
 
 def _onSceneStartClose(caller, event):
@@ -252,28 +357,63 @@ def _onSceneStartSave(caller, event):
 
 
 def _onSceneEndSave(caller, event):
+    # Restored from the event loop: the MRML file may still be written after this notification returns
+    swaps = list(_saveSwaps)
+    _saveSwaps[:] = []
+    if swaps:
+        qt.QTimer.singleShot(0, lambda: _restoreAfterSave(swaps))
+
+
+def _restoreAfterSave(swaps):
     try:
-        Easy_fusionLogic.restorePetOnlyViews(_saveSwaps)
+        Easy_fusionLogic.restorePetOnlyViews(swaps)
     except Exception:
         logging.exception("EasyFusion: could not restore PET-only views after saving")
-    finally:
-        _saveSwaps[:] = []
+
+
+# Post-load work runs as ONE ordered chain: scene repairs first, then the module panel (if it exists).
+# Separate timers per observer used to interleave with each other and with Slicer's own view rebuilding.
+_postLoadListeners = []
+_postLoadState = {"pending": False}
+
+
+def addPostLoadListener(callback):
+    if callback not in _postLoadListeners:
+        _postLoadListeners.append(callback)
+
+
+def removePostLoadListener(callback):
+    if callback in _postLoadListeners:
+        _postLoadListeners.remove(callback)
 
 
 def _onSceneEndImport(caller, event):
     # Nothing is changed inside the import notification itself: the layout manager may still be
     # rebuilding views for the loaded layout. All repairs run afterwards from the event loop.
-    qt.QTimer.singleShot(0, lambda: callWhenSceneIdle(_afterSceneLoad))
+    if _postLoadState["pending"]:
+        return
+    _postLoadState["pending"] = True
+    runWhenSceneSettled(_afterSceneLoad)
 
 
 def _afterSceneLoad():
+    _postLoadState["pending"] = False
     logic = Easy_fusionLogic()
     # First, before anything creates nodes: scenes saved by earlier versions contain views that refer to
     # the unsaved PET-only twin by ID. A new node given that ID would be picked up half-built.
-    logic.clearDanglingViewReferences()
-    logic.stopAllViewRotations()
-    logic.repairHotIronColorNodes()
-    logic.restoreViewRolesAfterLoad()
+    steps = [logic.clearDanglingViewReferences,
+             logic.stopAllViewRotations,
+             logic.repairHotIronColorNodes,
+             logic.restoreViewRolesAfterLoad]
+    steps += list(_postLoadListeners)
+    for step in steps:
+        if sceneIsBusy():
+            # Another load / close started in the meantime; its own EndImport schedules a new pass
+            return
+        try:
+            step()
+        except Exception:
+            logging.exception(f"EasyFusion: post-load step {getattr(step, '__name__', step)} failed")
 
 
 # PET window/level is kept identical between the fusion PET and its PET-only (inverted grey) twin.
@@ -327,6 +467,34 @@ def _syncWindowLevel(source, target):
 # Pure helpers (no Slicer dependency, easy to test)
 # ---------------------------------------------------------------------------
 
+def windowPresetForView(viewKind, sliceViewName, key):
+    """
+    Preset applied by a windowing shortcut key ("F5".."F9").
+    viewKind: "slice" or "threeD" for the view under the mouse, None when the mouse is not over a view.
+    CT-only slice views use the CT presets; fusion, PET-only and 3D views (and slice views that are not
+    EasyFusion views) use the SUV presets.
+    Returns ("ct", text, window, level), ("pet", text, window, level), or None if the key does nothing there.
+    """
+    if viewKind == "slice" and SLICE_VIEW_ROLES.get(sliceViewName, (None, "fusion"))[1] == "ct":
+        for text, window, level, presetKey in CT_WINDOW_PRESETS:
+            if presetKey == key:
+                return ("ct", text, window, level)
+        return None
+    if viewKind in ("slice", "threeD"):
+        for text, upper, presetKey in PET_SUV_PRESETS:
+            if presetKey == key:
+                return ("pet", text, upper, upper / 2.0)
+    return None
+
+
+def percentOfMaximum(maximum, percent):
+    """Upper window limit for the SPECT presets, or None when the image has no positive values."""
+    maximum, percent = float(maximum), float(percent)
+    if not np.isfinite(maximum) or maximum <= 0 or percent <= 0:
+        return None
+    return maximum * percent / 100.0
+
+
 def hotIronRGB(t):
     """Custom Hot Iron color stops for t in [0, 1]."""
     if t <= 0.5:
@@ -347,7 +515,7 @@ def sphereStatisticsFromArray(voxels, ijkToRas, centerRas, radiusMm,
     ijkToRas:  4x4 matrix (numpy) mapping voxel indices to RAS (mm)
     centerRas: sphere center in the volume's RAS coordinate system
     radiusMm:  sphere radius in mm
-    thresholdMode / thresholdValue: THRESHOLD_RELATIVE (% of SUVmax in the sphere) or THRESHOLD_ABSOLUTE (SUV)
+    thresholdMode / thresholdValue: THRESHOLD_RELATIVE (% of Max in the sphere) or THRESHOLD_ABSOLUTE (SUV)
 
     Returns None if the sphere does not touch the volume, otherwise a dict with
       max, mean, voxels, volumeMl           (whole sphere)
@@ -426,11 +594,13 @@ def formatRoiLabel(name, stats, hasPet):
     """Annotation shown next to the ROI in the views (multi-line)."""
     if stats is None:
         return f"{name}\n(outside PET)" if hasPet else f"{name}\n(no PET)"
-    return f"{name}\nSUVmax {stats['max']:.2f}\nSUVmean {stats['mean']:.2f}"
+    segMean = stats.get("segMean")
+    segText = f"{segMean:.2f}" if segMean is not None else "-"
+    return f"{name}\nMax {stats['max']:.2f}\nMean {segText}"  # Mean = thresholded segment mean
 
 
 def formatRoiTableRow(name, radius, stats):
-    """ROI | r (mm) | SUVmax | SUVmean | Seg SUVmean | MTV (mL) | TLG"""
+    """ROI | r (mm) | Max | Mean | Seg Mean | MTV (mL) | TLG"""
     values = [name, f"{radius:.1f}", "-", "-", "-", "-", "-"]
     if stats is not None:
         values[2] = f"{stats['max']:.2f}"
@@ -439,6 +609,25 @@ def formatRoiTableRow(name, radius, stats):
             values[4] = f"{stats['segMean']:.2f}"
         values[5] = f"{stats.get('mtvMl', 0.0):.2f}"
         values[6] = f"{stats.get('tlg', 0.0):.2f}"
+    return values
+
+
+def randomRoiColor(rng=random):
+    """Random, clearly visible color: any hue, strong saturation and brightness (reads on black PET and white MIP)."""
+    hue = rng.random()
+    saturation = 0.75 + 0.25 * rng.random()
+    value = 0.80 + 0.20 * rng.random()
+    return colorsys.hsv_to_rgb(hue, saturation, value)
+
+
+def parseRoiColor(text):
+    """(r, g, b) from "r g b", or None if the text is not a valid color."""
+    try:
+        values = tuple(float(v) for v in (text or "").split())
+    except ValueError:
+        return None
+    if len(values) != 3 or not all(0.0 <= v <= 1.0 for v in values):
+        return None
     return values
 
 
@@ -510,192 +699,103 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.observedViewNode = None
         self.roiNode = None
         self.handlesNode = None
-        self.placeRoiShortcut = None
+        self._shortcuts = []
         self._updatingRois = False
         self._roiStatsCache = {}
         self._knownRoiIDs = None
         self._lastRoiGeometry = {}       # ROI control point ID -> (center, radius) at last sync
         self._lastHandlePositions = {}   # handle control point ID -> position at last sync
         self._activeHandleID = None      # handle currently being dragged
-        self._syncingSlices = False
+        self._panelButtons = []
+        self.mipOverlay = MipRoiOverlay()
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
         self.logic = Easy_fusionLogic()
 
-        # Create collapsible section
         parametersCollapsibleButton = ctk.ctkCollapsibleButton()
         parametersCollapsibleButton.text = "Parameters"
         self.layout.addWidget(parametersCollapsibleButton)
         formLayout = qt.QFormLayout(parametersCollapsibleButton)
 
-        # 1️⃣ Input Volume Selector (PET Image)
-        self.inputVolumeSelector = slicer.qMRMLNodeComboBox()
-        self.inputVolumeSelector.nodeTypes = ["vtkMRMLScalarVolumeNode"]
-        self.inputVolumeSelector.selectNodeUponCreation = True
-        self.inputVolumeSelector.addEnabled = False
-        self.inputVolumeSelector.removeEnabled = False
-        self.inputVolumeSelector.noneEnabled = False
-        self.inputVolumeSelector.showHidden = False
-        self.inputVolumeSelector.showChildNodeTypes = False
-        self.inputVolumeSelector.setMRMLScene(slicer.mrmlScene)
-        self.inputVolumeSelector.setToolTip("Select the SPECT/PET image for fusion.")
+        # Input volumes
+        self.inputVolumeSelector = self._createVolumeSelector("Select the SPECT/PET image for fusion.")
         formLayout.addRow("SPECT/PET: ", self.inputVolumeSelector)
-
-        # 1️⃣ Input Volume Selector (CT Image)
-        self.inputVolumeSelectorCT = slicer.qMRMLNodeComboBox()
-        self.inputVolumeSelectorCT.nodeTypes = ["vtkMRMLScalarVolumeNode"]
-        self.inputVolumeSelectorCT.selectNodeUponCreation = True
-        self.inputVolumeSelectorCT.addEnabled = False
-        self.inputVolumeSelectorCT.removeEnabled = False
-        self.inputVolumeSelectorCT.noneEnabled = False
-        self.inputVolumeSelectorCT.showHidden = False
-        self.inputVolumeSelectorCT.showChildNodeTypes = False
-        self.inputVolumeSelectorCT.setMRMLScene(slicer.mrmlScene)
-        self.inputVolumeSelectorCT.setToolTip("Select the CT/MR image for fusion.")
+        self.inputVolumeSelectorCT = self._createVolumeSelector("Select the CT/MR image for fusion.")
         formLayout.addRow("CT/MRI: ", self.inputVolumeSelectorCT)
 
-        # Add dropdown for PET color map
         self.petColorMapSelector = qt.QComboBox()
-        self.petColorMapSelector.addItems(["Hot Iron", "Inferno", "Rainbow"])
+        self.petColorMapSelector.addItems(list(FUSION_COLOR_MAPS.keys()))
         formLayout.addRow("PET Color Map:", self.petColorMapSelector)
 
-        # 6️⃣ Fusion Button
         self.FusionButton = qt.QPushButton("Go")
-        self.FusionButton.enabled = True
+        self.FusionButton.connect("clicked(bool)", self.DoFusion)
         formLayout.addRow(self.FusionButton)
 
-        # Connect Calculate button to function
-        self.FusionButton.connect("clicked(bool)", self.DoFusion)
-
-        # Speed slider
+        # MIP rotation. The toggle button always mirrors the 3D view node (see updateRotationButton),
+        # so it can never get out of sync with what the view is actually doing.
         self.rotationSpeedSlider = ctk.ctkSliderWidget()
         self.rotationSpeedSlider.singleStep = 10
         self.rotationSpeedSlider.minimum = 10
         self.rotationSpeedSlider.maximum = 200
-        self.rotationSpeedSlider.value = 50  # Default speed
+        self.rotationSpeedSlider.value = 50
         self.rotationSpeedSlider.toolTip = "Lower is faster (ms per step)"
         formLayout.addRow("MIP Rotation Speed (ms):", self.rotationSpeedSlider)
 
-        # Toggle button. Its state always mirrors the 3D view node (see updateRotationButton),
-        # so it can never get out of sync with what the view is actually doing.
         self.toggleRotationButton = qt.QPushButton("Start MIP Rotation")
         self.toggleRotationButton.checkable = True
         formLayout.addRow(self.toggleRotationButton)
-
         self.toggleRotationButton.connect('toggled(bool)', self.setRotationEnabled)
         self.rotationSpeedSlider.connect('valueChanged(double)', self.updateRotationSpeed)
 
-        # Orientation buttons layout
-        orientationLayout = qt.QHBoxLayout()
-        self.orientationAnteriorButton = qt.QPushButton("Anterior")
-        self.orientationLeftButton = qt.QPushButton("Left")
-        self.orientationRightButton = qt.QPushButton("Right")
+        formLayout.addRow("Quick View:", self._buttonRow([
+            ("Anterior", lambda: self.rotateMIPToViewAxis(3)),
+            ("Left", lambda: self.rotateMIPToViewAxis(0)),
+            ("Right", lambda: self.rotateMIPToViewAxis(1)),
+        ]))
 
-        orientationLayout.addWidget(self.orientationAnteriorButton)
-        orientationLayout.addWidget(self.orientationLeftButton)
-        orientationLayout.addWidget(self.orientationRightButton)
-        self.orientationAnteriorButton.connect('clicked()', self.setViewAnterior)
-        self.orientationLeftButton.connect('clicked()', self.setViewLeft)
-        self.orientationRightButton.connect('clicked()', self.setViewRight)
-        formLayout.addRow("Quick View:", orientationLayout)
+        # Window / level presets
+        formLayout.addRow("CT Presets:", self._buttonRow([
+            (text, lambda window=window, level=level: self.setCTWindow(window, level),
+             f"Shortcut: {key} with the mouse over a CT view")
+            for text, window, level, key in CT_WINDOW_PRESETS]))
 
-        # CT windowing buttons
-        ctWLLayout = qt.QHBoxLayout()
-        self.ctAbdomenBtn = qt.QPushButton("CT: Abdomen")
-        self.ctHeadBtn = qt.QPushButton("CT: Head")
-        self.ctLungBtn = qt.QPushButton("CT: Lungs")
-        self.ctBoneBtn = qt.QPushButton("CT: Bones")
+        formLayout.addRow("PET Presets (SUV):", self._buttonRow([
+            (text, lambda upper=upper: self.setPETWindow(upper, upper / 2.0),
+             f"Shortcut: {key} with the mouse over a fusion, PET or 3D view")
+            for text, upper, key in PET_SUV_PRESETS]))
 
-        ctWLLayout.addWidget(self.ctAbdomenBtn)
-        ctWLLayout.addWidget(self.ctHeadBtn)
-        ctWLLayout.addWidget(self.ctLungBtn)
-        ctWLLayout.addWidget(self.ctBoneBtn)
-        formLayout.addRow("CT Presets:", ctWLLayout)
+        formLayout.addRow("SPECT Presets (% max):", self._buttonRow(
+            [(f"0–{percent}%", lambda percent=percent: self.setPETWindowPercentOfMax(percent))
+             for percent in SPECT_PERCENT_OF_MAX_PRESETS],
+            toolTip="Window from 0 to this percentage of the maximum count (voxel value) in the SPECT/PET volume."))
 
-        # PET windowing buttons
-        petWLLayout = qt.QHBoxLayout()
-        self.pet07Btn = qt.QPushButton("PET 0–7")
-        self.pet010Btn = qt.QPushButton("PET 0–10")
-        self.pet015Btn = qt.QPushButton("PET 0–15")
-        self.pet025Btn = qt.QPushButton("PET 0–25")
-        petWLLayout.addWidget(self.pet07Btn)
-        petWLLayout.addWidget(self.pet010Btn)
-        petWLLayout.addWidget(self.pet015Btn)
-        petWLLayout.addWidget(self.pet025Btn)
-        formLayout.addRow("PET Presets:", petWLLayout)
+        # PET color maps (two rows, no label on the second)
+        for rowIndex, row in enumerate(PET_COLOR_MAP_BUTTONS):
+            formLayout.addRow("PET Color Maps:" if rowIndex == 0 else "", self._buttonRow([
+                (text, lambda colorNodeName=colorNodeName: self.setPETColorMap(colorNodeName))
+                for text, colorNodeName in row]))
 
-        self.ctAbdomenBtn.connect('clicked()', lambda: self.setCTWindow(400, 50))
-        self.ctHeadBtn.connect('clicked()', lambda: self.setCTWindow(80, 40))
-        self.ctLungBtn.connect('clicked()', lambda: self.setCTWindow(1500, -600))
-        self.ctBoneBtn.connect('clicked()', lambda: self.setCTWindow(1800, 400))
+        # F5-F9 with the mouse over a view: CT presets on CT views, SUV presets on fusion / PET / 3D views
+        for key in WINDOW_SHORTCUT_KEYS:
+            self._addApplicationShortcut(getattr(qt.Qt, f"Key_{key}"), lambda key=key: self.onWindowShortcut(key))
 
-        self.pet07Btn.connect('clicked()', lambda: self.setPETWindow(7, 3.5))
-        self.pet010Btn.connect('clicked()', lambda: self.setPETWindow(10, 5))
-        self.pet015Btn.connect('clicked()', lambda: self.setPETWindow(15, 7.5))
-        self.pet025Btn.connect('clicked()', lambda: self.setPETWindow(25, 12.5))
-
-        # --- PET Color Map Buttons (Two Rows) ---
-        petColorRow1 = qt.QHBoxLayout()
-        petColorRow2 = qt.QHBoxLayout()
-
-        # First row
-        self.petHotIronBtn = qt.QPushButton("Hot Iron")
-        self.petInfernoBtn = qt.QPushButton("Inferno")
-        self.petRainbow2Btn = qt.QPushButton("Rainbow-2")
-
-        petColorRow1.addWidget(self.petHotIronBtn)
-        petColorRow1.addWidget(self.petInfernoBtn)
-        petColorRow1.addWidget(self.petRainbow2Btn)
-
-        # Second row
-        self.petRainbow1Btn = qt.QPushButton("PET-DICOM")
-        self.petRedBtn = qt.QPushButton("Red")
-        self.petHotMetBlue = qt.QPushButton("Hot Metal Blue")
-
-        petColorRow2.addWidget(self.petRainbow1Btn)
-        petColorRow2.addWidget(self.petRedBtn)
-        petColorRow2.addWidget(self.petHotMetBlue)
-
-        # Add both rows to the form layout
-        formLayout.addRow("PET Color Maps:", petColorRow1)
-        formLayout.addRow("", petColorRow2)  # no label for second row
-
-        self.petHotIronBtn.connect('clicked()', lambda: self.setPETColorMap(HOT_IRON_NAME))
-        self.petInfernoBtn.connect('clicked()', lambda: self.setPETColorMap("Inferno"))
-        self.petRainbow2Btn.connect('clicked()', lambda: self.setPETColorMap("PET-Rainbow2"))
-        self.petRainbow1Btn.connect('clicked()', lambda: self.setPETColorMap("PET-DICOM"))
-        self.petRedBtn.connect('clicked()', lambda: self.setPETColorMap("Red"))
-        self.petHotMetBlue.connect('clicked()', lambda: self.setPETColorMap("PET-HotMetalBlue"))
-
-        # 🖥️ Layouts section
         self.setupLayoutSection()
-
-        # 📏 SUV measurement section
         self.setupMeasurementSection()
 
         self.layout.addStretch(1)
 
-        # **✅ Load the banner image**
-        moduleDir = os.path.dirname(__file__)  # Get module directory
-        bannerPath = os.path.join(moduleDir, "Resources\\Icons\\fusbanner.jpg")  # Change to your banner file
-
+        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Icons", "fusbanner.jpg")
         if os.path.exists(bannerPath):
             bannerLabel = qt.QLabel()
-            bannerPixmap = qt.QPixmap(bannerPath)  # Load image
-            bannerLabel.setPixmap(bannerPixmap.scaledToWidth(400, qt.Qt.SmoothTransformation))  # Adjust width
-
-            # **Center the image**
+            bannerLabel.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(400, qt.Qt.SmoothTransformation))
             bannerLabel.setAlignment(qt.Qt.AlignCenter)
-
-            # **Add to layout**
             self.layout.addWidget(bannerLabel)
         else:
-            print(f"❌ WARNING: Banner file not found at {bannerPath}")
+            logging.warning(f"EasyFusion: banner file not found at {bannerPath}")
 
-        # 5️⃣ Info Text Box
         infoTextBox = qt.QTextEdit()
-        infoTextBox.setReadOnly(True)  # Make the text box read-only
+        infoTextBox.setReadOnly(True)
         infoTextBox.setPlainText(
             "This module provides eased visualization of PET images.\n"
             "This module is NOT a medical device. Research use only.\n"
@@ -703,14 +803,13 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             "For support and feedback: 4burakfe@gmail.com\n"
             "Version: alpha v1.0"
         )
-        infoTextBox.setToolTip("Module information and instructions.")  # Add a tooltip for additional help
+        infoTextBox.setToolTip("Module information and instructions.")
         self.layout.addWidget(infoTextBox)
 
         # Observers
         registerSceneObservers()  # in case the module was added after startup
-        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
-        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndImportEvent, self.onSceneEndImport)
+        addPostLoadListener(self.onSceneLoaded)  # runs after the scene repairs, in the same deferred pass
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.NodeAboutToBeRemovedEvent, self.onNodeAboutToBeRemoved)
         self.inputVolumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onPETVolumeChanged)
         if slicer.app.layoutManager() is not None:
@@ -720,6 +819,49 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.restoreFromSettings()
         self.connectToExistingRois()
         self.onLayoutChanged()
+
+    @staticmethod
+    def _createVolumeSelector(toolTip):
+        selector = slicer.qMRMLNodeComboBox()
+        selector.nodeTypes = ["vtkMRMLScalarVolumeNode"]
+        selector.selectNodeUponCreation = True
+        selector.addEnabled = False
+        selector.removeEnabled = False
+        selector.noneEnabled = False
+        selector.showHidden = False
+        selector.showChildNodeTypes = False
+        selector.setMRMLScene(slicer.mrmlScene)
+        selector.setToolTip(toolTip)
+        return selector
+
+    def _buttonRow(self, buttonSpecs, toolTip=None):
+        """Horizontal row of push buttons from (text, callback) or (text, callback, tooltip) tuples."""
+        rowLayout = qt.QHBoxLayout()
+        for spec in buttonSpecs:
+            text, callback = spec[0], spec[1]
+            button = qt.QPushButton(text)
+            buttonToolTip = spec[2] if len(spec) > 2 else toolTip
+            if buttonToolTip:
+                button.setToolTip(buttonToolTip)
+            button.connect('clicked()', callback)
+            rowLayout.addWidget(button)
+            # Keep a Python reference: the row layout has no parent widget yet, and PythonQt deletes
+            # parentless widgets whose wrapper is garbage collected.
+            self._panelButtons.append(button)
+        return rowLayout
+
+    def _addApplicationShortcut(self, keyCode, callback):
+        """
+        Application-wide shortcut: the Monitor 2 viewport is a separate window, and a main-window shortcut
+        stops working as soon as that window is active.
+        """
+        mainWindow = slicer.util.mainWindow()
+        if mainWindow is None:
+            return
+        shortcut = qt.QShortcut(qt.QKeySequence(keyCode), mainWindow)
+        shortcut.setContext(qt.Qt.ApplicationShortcut)
+        shortcut.connect('activated()', callback)
+        self._shortcuts.append(shortcut)
 
     def setupLayoutSection(self):
         layoutCollapsibleButton = ctk.ctkCollapsibleButton()
@@ -737,10 +879,18 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
              "Top: axial fusion | 3D MIP\nBottom: axial CT | axial PET (inverted grey)", 0, 1),
             (LAYOUT_TWO_BY_THREE_ID, "2×3 + 3D",
              "Top: axial fusion | axial CT\nBottom: sagittal fusion | sagittal CT\nRight column: 3D MIP", 1, 0),
+            (LAYOUT_CT_FUSION_PET_3D_ID, "CT | Fusion | PET + 3D",
+             "Top: axial CT | axial fusion | axial PET (inverted grey)\n"
+             "Bottom: sagittal CT | sagittal fusion | sagittal PET (inverted grey)\n"
+             "Right column: 3D MIP", 1, 1),
             (LAYOUT_DUAL_MONITOR_ID, "Dual Monitor",
              "Monitor 1: axial and sagittal fusion | CT | PET (3×2)\n"
              "Monitor 2 (separate window): 3D MIP | coronal fusion | coronal CT\n"
-             "Click again to bring the second window back if it was closed.", 1, 1),
+             "Click again to bring the second window back if it was closed.", 2, 0),
+            (LAYOUT_DUAL_MONITOR_FUSION_MIDDLE_ID, "Dual Monitor (Fusion Middle)",
+             "Monitor 1: axial and sagittal CT | fusion | PET (3×2)\n"
+             "Monitor 2 (separate window): 3D MIP | coronal fusion | coronal CT\n"
+             "Click again to bring the second window back if it was closed.", 2, 1),
         ]
         for layoutID, text, tooltip, row, column in layoutButtonSpecs:
             button = qt.QPushButton(text)
@@ -752,13 +902,6 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.layoutButtons[layoutID] = button
         layoutFormLayout.addRow(buttonGrid)
 
-        self.syncSliceViewsCheckBox = qt.QCheckBox("Sync scrolling, panning and zoom of same-orientation views")
-        self.syncSliceViewsCheckBox.checked = True
-        self.syncSliceViewsCheckBox.setToolTip(
-            "Scrolling the axial fusion view also scrolls the axial CT and PET views, and so on.\n"
-            "Keep Slicer's own view-link button off in these layouts: it copies volume selections\n"
-            "between views and would overwrite the CT-only / PET-only views.")
-        layoutFormLayout.addRow(self.syncSliceViewsCheckBox)
 
     def setupMeasurementSection(self):
         measurementCollapsibleButton = ctk.ctkCollapsibleButton()
@@ -791,10 +934,10 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         thresholdLayout = qt.QHBoxLayout()
         self.thresholdModeComboBox = qt.QComboBox()
-        self.thresholdModeComboBox.addItem("% of SUVmax", THRESHOLD_RELATIVE)
+        self.thresholdModeComboBox.addItem("% of Max", THRESHOLD_RELATIVE)
         self.thresholdModeComboBox.addItem("Absolute SUV", THRESHOLD_ABSOLUTE)
         self.thresholdModeComboBox.setToolTip(
-            "Relative: segment = voxels inside the ROI with SUV >= this % of the ROI's SUVmax.\n"
+            "Relative: segment = voxels inside the ROI with SUV >= this % of the ROI's Max.\n"
             "Absolute: segment = voxels inside the ROI with SUV >= this value.")
         self.thresholdValueSpinBox = qt.QDoubleSpinBox()
         self.thresholdValueSpinBox.setDecimals(1)
@@ -808,12 +951,19 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.roiPetLabel = qt.QLabel("Measuring on: (no PET selected)")
         measurementLayout.addRow(self.roiPetLabel)
 
+        self.showRoisOnMipCheckBox = qt.QCheckBox("Show ROI segments and values on the MIP (3D view)")
+        self.showRoisOnMipCheckBox.checked = True
+        self.showRoisOnMipCheckBox.setToolTip(
+            "Draws the thresholded segments and the Max / Mean text on top of the MIP.\n"
+            "Display only: nothing is added to the scene or saved.")
+        measurementLayout.addRow(self.showRoisOnMipCheckBox)
+
         self.roiTable = qt.QTableWidget()
         self.roiTable.setColumnCount(7)
-        self.roiTable.setHorizontalHeaderLabels(["ROI", "r (mm)", "SUVmax", "SUVmean", "Seg SUVmean", "MTV (mL)", "TLG"])
+        self.roiTable.setHorizontalHeaderLabels(["ROI", "r (mm)", "Max", "Mean", "Seg Mean", "MTV (mL)", "TLG"])
         headerTips = ["", "ROI radius", "Maximum SUV inside the ROI sphere", "Mean SUV of the whole ROI sphere",
                       "Mean SUV of the thresholded segment", "Metabolic tumor volume: volume of the thresholded segment",
-                      "Total lesion glycolysis = Seg SUVmean x MTV"]
+                      "Total lesion glycolysis = Seg Mean x MTV"]
         for column, tip in enumerate(headerTips):
             headerItem = self.roiTable.horizontalHeaderItem(column)
             if headerItem is not None and tip:
@@ -835,6 +985,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.roiTable.connect('itemSelectionChanged()', self.onRoiSelectionChanged)
         self.thresholdModeComboBox.connect('currentIndexChanged(int)', self.onThresholdModeChanged)
         self.thresholdValueSpinBox.connect('valueChanged(double)', self.onThresholdValueChanged)
+        self.showRoisOnMipCheckBox.connect('toggled(bool)', self.onShowRoisOnMipToggled)
 
         # Batch rapid point events (e.g. dragging) into one recomputation
         self.roiUpdateTimer = qt.QTimer()
@@ -842,49 +993,46 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.roiUpdateTimer.setInterval(60)
         self.roiUpdateTimer.connect('timeout()', self.updateRois)
 
-        # Insert key: drop an ROI at the mouse cursor. Application-wide, because the Monitor 2 viewport
-        # is a separate window and a main-window shortcut stops working as soon as that window is active.
-        mainWindow = slicer.util.mainWindow()
-        if mainWindow is not None:
-            self.placeRoiShortcut = qt.QShortcut(qt.QKeySequence(qt.Qt.Key_Insert), mainWindow)
-            self.placeRoiShortcut.setContext(qt.Qt.ApplicationShortcut)
-            self.placeRoiShortcut.connect('activated()', self.onPlaceRoiAtCursor)
+        # Insert key: drop an ROI at the mouse cursor
+        self._addApplicationShortcut(qt.Qt.Key_Insert, self.onPlaceRoiAtCursor)
 
     def enter(self):
         self.observeThreeDViewNode()
         self.onLayoutChanged()
 
     def cleanup(self):
+        try:
+            self.mipOverlay.clear()
+        except Exception:
+            logging.exception("EasyFusion: could not remove the MIP overlay")
         if hasattr(self, "roiUpdateTimer"):
             self.roiUpdateTimer.stop()
-        if self.placeRoiShortcut is not None:
-            # Otherwise a module reload leaves two Insert shortcuts and Qt fires neither
-            self.placeRoiShortcut.setEnabled(False)
-            self.placeRoiShortcut.setParent(None)
-            self.placeRoiShortcut = None
+        # Otherwise a module reload leaves duplicate shortcuts, and Qt fires neither of two identical ones
+        for shortcut in self._shortcuts:
+            shortcut.setEnabled(False)
+            shortcut.setParent(None)
+        self._shortcuts = []
         if slicer.app.layoutManager() is not None:
             slicer.app.layoutManager().disconnect("layoutChanged(int)", self.onLayoutChanged)
+        removePostLoadListener(self.onSceneLoaded)
         self.removeObservers()
 
     # ------------------------------------------------------------------
     # Scene events
     # ------------------------------------------------------------------
 
-    def onSceneStartClose(self, caller=None, event=None):
-        # Drop references to view nodes before the scene (and possibly the layout) is torn down
-        self.removeObservers(self.onSliceNodeModified)
-
     def onSceneEndClose(self, caller=None, event=None):
+        self.mipOverlay.clear()
         self.setRoiNode(None)
         self.setHandlesNode(None)
         self.fillRoiTable([])
-        qt.QTimer.singleShot(0, lambda: callWhenSceneIdle(self.refreshViewsAfterSceneChange))
+        runWhenSceneSettled(self.refreshViewsAfterSceneChange)
 
-    def onSceneEndImport(self, caller=None, event=None):
+    def onSceneLoaded(self):
+        """Called by the post-load chain (see _afterSceneLoad), after the scene repairs."""
         self.restoreFromSettings()
         self.connectToExistingRois()
-        # Views of a loaded layout are rebuilt by Slicer after this notification; touch them only afterwards
-        qt.QTimer.singleShot(0, lambda: callWhenSceneIdle(self.refreshViewsAfterSceneChange))
+        self.refreshViewsAfterSceneChange()
 
     def refreshViewsAfterSceneChange(self):
         self.observeThreeDViewNode()
@@ -904,60 +1052,40 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onPETVolumeChanged(self, node=None):
         self.scheduleRoiUpdate()
 
+    def onShowRoisOnMipToggled(self, checked):
+        self.mipOverlay.setEnabled(checked)
+        self.scheduleRoiUpdate()
+
     # ------------------------------------------------------------------
     # Fusion
     # ------------------------------------------------------------------
 
     def DoFusion(self):
-        # Set parameters
-        referenceCT = self.inputVolumeSelectorCT.currentNode()
-        PETvol = self.inputVolumeSelector.currentNode()
-        if PETvol is None or referenceCT is None:
+        ctNode = self.inputVolumeSelectorCT.currentNode()
+        petNode = self.inputVolumeSelector.currentNode()
+        if petNode is None or ctNode is None:
             slicer.util.errorDisplay("Please select both a SPECT/PET and a CT/MRI volume.")
             return
-        if PETvol.GetDisplayNode() is None:
-            PETvol.CreateDefaultDisplayNodes()
-        if referenceCT.GetDisplayNode() is None:
-            referenceCT.CreateDefaultDisplayNodes()
+        if petNode.GetDisplayNode() is None:
+            petNode.CreateDefaultDisplayNodes()
+        if ctNode.GetDisplayNode() is None:
+            ctNode.CreateDefaultDisplayNodes()
 
-        window = 10
-        level = 5
-        petDisplayNode = PETvol.GetDisplayNode()
+        petDisplayNode = petNode.GetDisplayNode()
         petDisplayNode.SetAutoWindowLevel(False)
-        petDisplayNode.SetWindow(window)
-        petDisplayNode.SetLevel(level)
+        petDisplayNode.SetWindow(10)
+        petDisplayNode.SetLevel(5)
         petDisplayNode.SetInterpolate(True)
 
         # Only one MIP at a time: hide volume rendering of any previously used PET (or any other volume)
-        self.logic.showOnlyThisVolumeRendering(PETvol)
+        self.logic.showOnlyThisVolumeRendering(petNode)
+        mipDisplayNode = slicer.modules.volumerendering.logic().CreateDefaultVolumeRenderingNodes(petNode)
+        mipDisplayNode.SetVisibility(True)
+        self.logic.setMIPRange(mipDisplayNode, 0.0, 10.0, flatOpacity=True)
 
-        volumeRenderingLogic = slicer.modules.volumerendering.logic()
-        MIPdisplayNode = volumeRenderingLogic.CreateDefaultVolumeRenderingNodes(PETvol)
-        MIPdisplayNode.SetVisibility(True)
-        # Get the associated property node
-        propertyNode = MIPdisplayNode.GetVolumePropertyNode()
-
-        if propertyNode:
-            scalarOpacity = propertyNode.GetScalarOpacity()
-            volumeProperty = propertyNode.GetVolumeProperty()
-            colorFunc = volumeProperty.GetRGBTransferFunction(0)
-            colorFunc.RemoveAllPoints()
-            colorFunc.AddRGBPoint(0, 1.0, 1.0, 1.0)  # Low = white
-            colorFunc.AddRGBPoint(10, 0.0, 0.0, 0.0)  # High = black
-            # Clear previous function
-            scalarOpacity.RemoveAllPoints()
-
-            # Set a flat opacity mapping
-            scalarOpacity.AddPoint(0, 1.0)     # intensity 0 → opacity 1.0
-            scalarOpacity.AddPoint(10, 1.0)  # intensity max → opacity 1.0
-
-            # Notify Slicer of the update
-            propertyNode.Modified()
-            MIPdisplayNode.Modified()
-
-        threeDwidg = self.getThreeDWidget()
-        if threeDwidg is not None:
-            viewNode = threeDwidg.mrmlViewNode()
+        threeDWidget = self.getThreeDWidget()
+        if threeDWidget is not None:
+            viewNode = threeDWidget.mrmlViewNode()
             wasModifying = viewNode.StartModify()
             viewNode.SetRaycastTechnique(2)   # MIP
             viewNode.SetRenderMode(1)         # orthographic
@@ -972,23 +1100,19 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             viewNode.EndModify(wasModifying)
             self.observeThreeDViewNode()
 
-            threeDView = threeDwidg.threeDView()
+            threeDView = threeDWidget.threeDView()
             threeDView.resetFocalPoint()
             threeDView.rotateToViewAxis(3)
-            self.fitMIPToView(PETvol)
+            self.fitMIPToView(petNode)
 
-        referenceCT.GetDisplayNode().SetAndObserveColorNodeID(slicer.util.getNode("Grey").GetID())
-        colorMapText = self.petColorMapSelector.currentText
-        if colorMapText == "Hot Iron":
-            petDisplayNode.SetAndObserveColorNodeID(self.logic.getOrCreateHotIronColorNode().GetID())
-        elif colorMapText == "Inferno":
-            petDisplayNode.SetAndObserveColorNodeID(slicer.util.getNode("Inferno").GetID())
-        elif colorMapText == "Rainbow":
-            petDisplayNode.SetAndObserveColorNodeID(slicer.util.getNode("PET-Rainbow2").GetID())
+        ctNode.GetDisplayNode().SetAndObserveColorNodeID(slicer.util.getNode("Grey").GetID())
+        colorNodeName = FUSION_COLOR_MAPS.get(self.petColorMapSelector.currentText)
+        if colorNodeName is not None:
+            self.setPETColorMap(colorNodeName)
 
-        # **✅ Fill every EasyFusion view: fusion (CT + PET), CT only, PET only (inverted grey)**
-        self.logic.rememberVolumes(PETvol, referenceCT)
-        changedViews = self.logic.applyViewRoles(PETvol, referenceCT)
+        # Fill every EasyFusion view: fusion (CT + PET), CT only, PET only (inverted grey)
+        self.logic.rememberVolumes(petNode, ctNode)
+        changedViews = self.logic.applyViewRoles(petNode, ctNode)
         self.afterViewRolesApplied(changedViews)
 
         self.scheduleRoiUpdate()
@@ -1014,12 +1138,11 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.util.showStatusMessage("EasyFusion: select the SPECT/PET and CT/MRI volumes to fill the views.", 4000)
         self.afterViewRolesApplied(changedViews)
 
-        if layoutID == LAYOUT_DUAL_MONITOR_ID:
+        if layoutID in DUAL_MONITOR_LAYOUT_IDS:
             qt.QTimer.singleShot(300, self.logic.placeSecondaryViewportWindow)
         self.onLayoutChanged()
 
     def afterViewRolesApplied(self, changedViews):
-        self.observeSliceViewsForSync()
         # Views need their final size before fitting / copying zoom, so wait for the layout to settle
         qt.QTimer.singleShot(150, lambda: self.alignSliceViews(changedViews))
 
@@ -1028,7 +1151,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
         if sceneIsBusy():
             # Layout switches during scene loading: views are still being rebuilt, look at them later
-            qt.QTimer.singleShot(0, lambda: callWhenSceneIdle(self.onLayoutChanged))
+            deferUntilSceneIdle(self.onLayoutChanged)
             return
         layoutManager = slicer.app.layoutManager()
         current = layoutManager.layout if layoutManager is not None else None
@@ -1036,7 +1159,8 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         for buttonLayoutID, button in self.layoutButtons.items():
             button.checked = (buttonLayoutID == current)
         self.layoutButtonGroup.setExclusive(True)
-        self.observeSliceViewsForSync()
+        # A layout switch can create new 3D views (or move them to the Monitor 2 window): re-attach the MIP overlay
+        self.scheduleRoiUpdate()
 
     def restoreFromSettings(self):
         settingsNode = self.logic.getSettingsNode(create=False)
@@ -1110,66 +1234,28 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         settingsNode.SetAttribute(SETTINGS_RELATIVE_THRESHOLD, f"{self._relativeThreshold:g}")
         settingsNode.SetAttribute(SETTINGS_ABSOLUTE_THRESHOLD, f"{self._absoluteThreshold:g}")
 
-    def _roleSliceWidgets(self, visibleOnly=False):
-        layoutManager = slicer.app.layoutManager()
-        widgets = []
-        if layoutManager is None:
-            return widgets
-        if sceneIsBusy():
-            return widgets
-        for name in layoutManager.sliceViewNames():
-            if name not in SLICE_VIEW_ROLES:
-                continue
-            sliceWidget = layoutManager.sliceWidget(name)
-            if sliceWidget is None or (visibleOnly and not sliceWidget.visible):
-                continue
-            sliceNode = sliceWidget.mrmlSliceNode()
-            if sliceNode is None or not slicer.mrmlScene.IsNodePresent(sliceNode):
-                continue  # widget left over from a previous layout / scene
-            widgets.append((name, sliceWidget))
-        return widgets
-
-    def observeSliceViewsForSync(self):
-        for name, sliceWidget in self._roleSliceWidgets():
-            sliceNode = sliceWidget.mrmlSliceNode()
-            if not self.hasObserver(sliceNode, vtk.vtkCommand.ModifiedEvent, self.onSliceNodeModified):
-                self.addObserver(sliceNode, vtk.vtkCommand.ModifiedEvent, self.onSliceNodeModified)
-
-    def onSliceNodeModified(self, caller, event=None):
-        """Mirror user scrolling / panning / zooming to the other visible views with the same orientation."""
-        if self._syncingSlices or caller is None or not self.syncSliceViewsCheckBox.checked or sceneIsBusy():
-            return
-        if not caller.GetInteracting():
-            return  # only user interaction; avoids feedback from resizes and programmatic changes
-        orientation = self.logic.getSliceOrientation(caller)
-        self._syncingSlices = True
-        try:
-            for name, sliceWidget in self._roleSliceWidgets(visibleOnly=True):
-                target = sliceWidget.mrmlSliceNode()
-                if target is caller or self.logic.getSliceOrientation(target) != orientation:
-                    continue
-                self.logic.copySliceGeometry(caller, target)
-        finally:
-            self._syncingSlices = False
+    # ------------------------------------------------------------------
+    # Slice view alignment (scroll / pan / zoom sync itself: Slicer's view-link button)
+    # ------------------------------------------------------------------
 
     def alignSliceViews(self, changedViews):
         """Fit views whose CT changed, then give same-orientation views the same position and zoom."""
         if sceneIsBusy():
             return
         groups = {}
-        for name, sliceWidget in self._roleSliceWidgets(visibleOnly=True):
+        for name, sliceWidget in self.logic.roleSliceWidgets(visibleOnly=True):
             groups.setdefault(self.logic.getSliceOrientation(sliceWidget.mrmlSliceNode()), []).append((name, sliceWidget))
-        self._syncingSlices = True
-        try:
-            for members in groups.values():
-                reference = next((m for m in members if SLICE_VIEW_ROLES[m[0]][1] == "fusion"), members[0])
-                if any(name in changedViews for name, _ in members):
-                    reference[1].sliceLogic().FitSliceToAll()
-                for name, sliceWidget in members:
-                    if sliceWidget is not reference[1]:
-                        self.logic.copySliceGeometry(reference[1].mrmlSliceNode(), sliceWidget.mrmlSliceNode())
-        finally:
-            self._syncingSlices = False
+        for members in groups.values():
+            referenceWidget = next((w for name, w in members if SLICE_VIEW_ROLES[name][1] == "fusion"), members[0][1])
+            if any(name in changedViews for name, _ in members):
+                referenceWidget.sliceLogic().FitSliceToAll()
+            for name, sliceWidget in members:
+                if sliceWidget is not referenceWidget:
+                    self.logic.copySliceGeometry(referenceWidget.mrmlSliceNode(), sliceWidget.mrmlSliceNode())
+
+    # ------------------------------------------------------------------
+    # MIP (3D view)
+    # ------------------------------------------------------------------
 
     def fitMIPToView(self, volumeNode):
         threeDWidget = self.getThreeDWidget()
@@ -1183,10 +1269,6 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         renderer = threeDWidget.threeDView().renderWindow().GetRenderers().GetFirstRenderer()
         renderer.GetActiveCamera().SetParallelScale(height * 0.6)  # Zoom fit
         threeDWidget.threeDView().forceRender()
-
-    # ------------------------------------------------------------------
-    # MIP rotation
-    # ------------------------------------------------------------------
 
     @staticmethod
     def getThreeDWidget():
@@ -1231,36 +1313,17 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         viewNode.EndModify(wasModifying)
         self.updateRotationButton()
 
-    def toggleRotation(self):
-        viewNode = self.observeThreeDViewNode(updateButton=False)
-        spinning = viewNode is not None and viewNode.GetAnimationMode() == ANIMATION_SPIN
-        self.setRotationEnabled(not spinning)
-
     def updateRotationSpeed(self, value):
         viewNode = self.observeThreeDViewNode(updateButton=False)
         if viewNode is not None:
             viewNode.SetAnimationMs(int(value))
 
-    def stopRotationIfActive(self):
+    def rotateMIPToViewAxis(self, axis):
+        """Quick view buttons: 3 = anterior, 0 = left, 1 = right. Stops the rotation first."""
         self.setRotationEnabled(False)
-
-    def setViewAnterior(self):
-        self.stopRotationIfActive()
         threeDWidget = self.getThreeDWidget()
-        if threeDWidget:
-            threeDWidget.threeDView().rotateToViewAxis(3)  # 3 = Anterior
-
-    def setViewLeft(self):
-        self.stopRotationIfActive()
-        threeDWidget = self.getThreeDWidget()
-        if threeDWidget:
-            threeDWidget.threeDView().rotateToViewAxis(0)  # 0 = Left
-
-    def setViewRight(self):
-        self.stopRotationIfActive()
-        threeDWidget = self.getThreeDWidget()
-        if threeDWidget:
-            threeDWidget.threeDView().rotateToViewAxis(1)  # 1 = Right
+        if threeDWidget is not None:
+            threeDWidget.threeDView().rotateToViewAxis(axis)
 
     # ------------------------------------------------------------------
     # Window / level and color maps
@@ -1269,58 +1332,64 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def setCTWindow(self, window, level):
         ctNode = self.inputVolumeSelectorCT.currentNode()
         if ctNode and ctNode.GetDisplayNode():
-            dnode = ctNode.GetDisplayNode()
-            dnode.SetAutoWindowLevel(False)
-            dnode.SetWindow(window)
-            dnode.SetLevel(level)
+            displayNode = ctNode.GetDisplayNode()
+            displayNode.SetAutoWindowLevel(False)
+            displayNode.SetWindow(window)
+            displayNode.SetLevel(level)
 
     def setPETWindow(self, window, level):
+        """Window / level of the PET in the slice views (PET-only views follow) and the MIP grey range."""
         petNode = self.inputVolumeSelector.currentNode()
         if not petNode:
             return
         if petNode.GetDisplayNode():
-            dnode = petNode.GetDisplayNode()
-            dnode.SetAutoWindowLevel(False)
-            dnode.SetWindow(window)
-            dnode.SetLevel(level)
-        # --- Update Volume Rendering Color Transfer ---
-        volumeRenderingLogic = slicer.modules.volumerendering.logic()
-        vrDisplayNode = volumeRenderingLogic.GetFirstVolumeRenderingDisplayNode(petNode)
-        if vrDisplayNode:
-            vrPropNode = vrDisplayNode.GetVolumePropertyNode()
-            if vrPropNode:
-                volumeProperty = vrPropNode.GetVolumeProperty()
-                colorFunc = volumeProperty.GetRGBTransferFunction(0)
+            displayNode = petNode.GetDisplayNode()
+            displayNode.SetAutoWindowLevel(False)
+            displayNode.SetWindow(window)
+            displayNode.SetLevel(level)
+        vrDisplayNode = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(petNode)
+        self.logic.setMIPRange(vrDisplayNode, level - window / 2.0, level + window / 2.0)
 
-                minVal = level - window / 2
-                maxVal = level + window / 2
+    def onWindowShortcut(self, key):
+        """F5-F9: apply the preset for this key that belongs to the view under the mouse (see windowPresetForView)."""
+        view = self.logic.viewUnderCursor()
+        preset = windowPresetForView(view[0], view[1], key) if view is not None else None
+        if preset is None:
+            return
+        kind, text, window, level = preset
+        if kind == "ct":
+            self.setCTWindow(window, level)
+            slicer.util.showStatusMessage(f"EasyFusion: {text}", 2000)
+        else:
+            self.setPETWindow(window, level)
+            slicer.util.showStatusMessage(f"EasyFusion: SUV {text}", 2000)
 
-                colorFunc.RemoveAllPoints()
-                colorFunc.AddRGBPoint(minVal, 1.0, 1.0, 1.0)  # Low = white
-                colorFunc.AddRGBPoint(maxVal, 0.0, 0.0, 0.0)  # High = black
-
-                vrPropNode.Modified()
-                vrDisplayNode.Modified()
-
-    def createCustomHotIronColorNode(self):
-        # Kept for backward compatibility with any external callers
-        return self.logic.getOrCreateHotIronColorNode()
+    def setPETWindowPercentOfMax(self, percent):
+        """SPECT presets: window from 0 to a percentage of the highest voxel value (count) in the volume."""
+        petNode = self.inputVolumeSelector.currentNode()
+        if petNode is None or petNode.GetImageData() is None:
+            slicer.util.showStatusMessage("EasyFusion: select a SPECT/PET volume first.", 3000)
+            return
+        upper = percentOfMaximum(self.logic.getVolumeMaximum(petNode), percent)
+        if upper is None:
+            slicer.util.showStatusMessage("EasyFusion: the SPECT/PET volume has no positive counts.", 3000)
+            return
+        self.setPETWindow(upper, upper / 2.0)
 
     def setPETColorMap(self, colorNodeName):
         petNode = self.inputVolumeSelector.currentNode()
         if not petNode:
             return
-
         if colorNodeName == HOT_IRON_NAME:
             colorNode = self.logic.getOrCreateHotIronColorNode()
         else:
             try:
                 colorNode = slicer.util.getNode(colorNodeName)
             except Exception:
+                colorNode = None
+            if colorNode is None:
                 slicer.util.errorDisplay(f"Color node '{colorNodeName}' not found.")
                 return
-
-        # --- Set 2D display ---
         displayNode = petNode.GetDisplayNode()
         if displayNode:
             displayNode.SetAndObserveColorNodeID(colorNode.GetID())
@@ -1426,6 +1495,12 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if node is not None and not scene.IsNodePresent(node):
             self.setRoiNode(None)
             node = None
+        if node is None:
+            # A just-loaded scene may already hold ROIs the panel has not connected to yet.
+            # Never delete their spheres / handles / labels / segments in that case.
+            node = self.logic.findRoiNode()
+            if node is not None:
+                self.setRoiNode(node)
 
         pet = self.inputVolumeSelector.currentNode()
         self.roiPetLabel.text = f"Measuring on: {pet.GetName()}" if pet else "Measuring on: (no PET selected)"
@@ -1437,12 +1512,14 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.removeRoiLabelsNode()
             self.logic.removeRoiSegmentationNode()
             self.fillRoiTable([])
+            self.mipOverlay.clear()
             return
 
         thresholdMode, thresholdValue = self.currentThreshold()
         selectedID = self.selectedRoiPointID()
         rows, spheres, newCache = [], [], {}
-        labelEntries, segmentEntries = [], []
+        labelEntries, segmentEntries, mipEntries = [], [], []
+        roiColors = {}
         draggedRoiID = None
         self._updatingRois = True
         try:
@@ -1461,6 +1538,8 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             for index, pointID, center in rois:
                 radius = self.logic.getRoiRadius(node, pointID, self.roiRadiusSpinBox.value)
                 number = self.logic.getRoiNumber(node, pointID)
+                color = self.logic.getRoiColor(node, pointID)
+                roiColors[pointID] = color
 
                 key = self.logic.statsCacheKey(pet, center, radius, thresholdMode, thresholdValue)
                 unchanged = key in self._roiStatsCache
@@ -1477,9 +1556,10 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     node.SetNthControlPointLabel(index, name)
 
                 rows.append((pointID, name, radius, stats))
-                spheres.append((center, radius))
+                spheres.append((center, radius, color))
                 labelEntries.append((pointID, center, radius, formatRoiLabel(name, stats, pet is not None)))
-                segmentEntries.append((pointID, name, stats, unchanged))
+                mipEntries.append((pointID, center, formatRoiLabel(name, stats, pet is not None), color))
+                segmentEntries.append((pointID, name, stats, unchanged, color))
 
             if pet is not None and rows and node.GetNodeReferenceID(ROI_PET_REFERENCE_ROLE) != pet.GetID():
                 node.SetNodeReferenceID(ROI_PET_REFERENCE_ROLE, pet.GetID())
@@ -1505,7 +1585,11 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.updateRoiSegments(segmentEntries, pet)
         except Exception:
             logging.exception("EasyFusion: could not update ROI segments")
-        self.fillRoiTable(rows, selectedID)
+        try:
+            self.mipOverlay.update(mipEntries, self.logic.findRoiSegmentationNode())
+        except Exception:
+            logging.exception("EasyFusion: could not update the MIP overlay")
+        self.fillRoiTable(rows, selectedID, roiColors)
         self.syncRadiusSpinBox(rows, selectedID)
         if newRoiCenter is not None:
             self.jumpSliceViewsTo(newRoiCenter)
@@ -1620,7 +1704,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     self.roiRadiusSpinBox.blockSignals(wasBlocked)
                 return
 
-    def fillRoiTable(self, rows, selectPointID=None):
+    def fillRoiTable(self, rows, selectPointID=None, colors=None):
         if not hasattr(self, "roiTable"):
             return
         table = self.roiTable
@@ -1633,6 +1717,10 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     item = qt.QTableWidgetItem(text)
                     if column == 0:
                         item.setData(qt.Qt.UserRole, pointID)
+                        color = (colors or {}).get(pointID)
+                        if color is not None:  # color swatch next to the ROI name
+                            item.setData(qt.Qt.DecorationRole,
+                                         qt.QColor.fromRgbF(float(color[0]), float(color[1]), float(color[2])))
                     table.setItem(rowIndex, column, item)
             table.clearSelection()
             if selectPointID is not None:
@@ -1750,6 +1838,155 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 # Logic
 # ---------------------------------------------------------------------------
 
+class MipRoiOverlay:
+    """
+    Segment surfaces and ROI text drawn on top of the MIP in every 3D view.
+    Pure VTK in an extra render layer: nothing is added to the scene, so nothing is saved.
+    Render windows are never kept: each update looks the views up again, so layout changes
+    (views re-created, Monitor 2 window) only ever see renderers that belong to live windows.
+    """
+
+    def __init__(self):
+        self.enabled = True
+        self._overlays = []   # [(renderer, props)] currently attached to live 3D views
+
+    def setEnabled(self, enabled):
+        self.enabled = bool(enabled)
+
+    @staticmethod
+    def _threeDViews():
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return []
+        views = []
+        for index in range(layoutManager.threeDViewCount):
+            widget = layoutManager.threeDWidget(index)
+            if widget is not None and widget.threeDView() is not None:
+                views.append(widget.threeDView())
+        return views
+
+    def _overlayRenderer(self, threeDView):
+        renderWindow = threeDView.renderWindow()
+        for renderer, _ in self._overlays:
+            if renderWindow.HasRenderer(renderer):
+                return renderer
+        mainRenderer = renderWindow.GetRenderers().GetFirstRenderer()
+        if mainRenderer is None:
+            return None
+        renderer = vtk.vtkRenderer()
+        layer = renderWindow.GetNumberOfLayers()
+        renderWindow.SetNumberOfLayers(layer + 1)
+        renderer.SetLayer(layer)
+        renderer.SetInteractive(False)   # never picks or steals mouse interaction from the 3D view
+        renderer.SetActiveCamera(mainRenderer.GetActiveCamera())
+        renderWindow.AddRenderer(renderer)
+        self._overlays.append((renderer, []))
+        return renderer
+
+    def _liveOverlays(self, views):
+        """Forget overlays whose render window is gone (only Python references are dropped)."""
+        windows = [view.renderWindow() for view in views]
+        self._overlays = [(renderer, props) for renderer, props in self._overlays
+                          if any(window.HasRenderer(renderer) for window in windows)]
+
+    def clear(self):
+        views = self._threeDViews()
+        self._liveOverlays(views)
+        for renderer, props in self._overlays:
+            renderer.RemoveAllViewProps()
+            props[:] = []
+        for view in views:
+            view.scheduleRender()
+
+    @staticmethod
+    def _segmentSurfaceWorld(segmentationNode, segmentID):
+        polyData = vtk.vtkPolyData()
+        if hasattr(segmentationNode, "GetClosedSurfaceRepresentation"):
+            segmentationNode.GetClosedSurfaceRepresentation(segmentID, polyData)
+        else:
+            internal = segmentationNode.GetClosedSurfaceInternalRepresentation(segmentID)
+            if internal is not None:
+                polyData.DeepCopy(internal)
+        if polyData.GetNumberOfPoints() == 0:
+            return None
+        transformNode = segmentationNode.GetParentTransformNode()
+        if transformNode is None:
+            return polyData
+        toWorld = vtk.vtkGeneralTransform()
+        transformNode.GetTransformToWorld(toWorld)
+        transformFilter = vtk.vtkTransformPolyDataFilter()
+        transformFilter.SetTransform(toWorld)
+        transformFilter.SetInputData(polyData)
+        transformFilter.Update()
+        worldPolyData = vtk.vtkPolyData()
+        worldPolyData.DeepCopy(transformFilter.GetOutput())
+        return worldPolyData
+
+    @staticmethod
+    def _textActor(text, positionWorld):
+        actor = vtk.vtkBillboardTextActor3D()
+        actor.SetInput(text)
+        actor.SetPosition(*positionWorld)
+        actor.SetDisplayOffset(*MIP_OVERLAY_TEXT_OFFSET_PX)
+        textProperty = actor.GetTextProperty()
+        textProperty.SetFontSize(MIP_OVERLAY_FONT_SIZE)
+        textProperty.SetColor(*MIP_OVERLAY_TEXT_COLOR)
+        textProperty.SetBackgroundColor(*MIP_OVERLAY_TEXT_BACKGROUND)
+        textProperty.SetBackgroundOpacity(MIP_OVERLAY_TEXT_BACKGROUND_OPACITY)
+        textProperty.SetShadow(False)
+        textProperty.SetBold(True)
+        textProperty.SetJustificationToLeft()
+        textProperty.SetVerticalJustificationToBottom()
+        return actor
+
+    def update(self, entries, segmentationNode):
+        """
+        entries: list of (roiPointID, centerWorld, text, color). Segment surfaces are taken from segmentationNode
+        (segment ID = ROI_SEGMENT_ID_PREFIX + roiPointID); a ROI whose segment is empty only shows its text.
+        """
+        if not self.enabled or not entries or sceneIsBusy():
+            self.clear()
+            return
+        views = self._threeDViews()
+        self._liveOverlays(views)
+        if not views:
+            return
+
+        surfaces = []
+        if segmentationNode is not None and slicer.mrmlScene.IsNodePresent(segmentationNode):
+            Easy_fusionLogic.ensureUnsmoothedClosedSurface(segmentationNode)
+            segmentation = segmentationNode.GetSegmentation()
+            for roiID, _, _, color in entries:
+                segmentID = ROI_SEGMENT_ID_PREFIX + roiID
+                if segmentation.GetSegment(segmentID) is None:
+                    continue
+                polyData = self._segmentSurfaceWorld(segmentationNode, segmentID)
+                if polyData is not None:
+                    surfaces.append((polyData, color))
+
+        for view in views:
+            renderer = self._overlayRenderer(view)
+            if renderer is None:
+                continue
+            props = next(props for r, props in self._overlays if r is renderer)
+            renderer.RemoveAllViewProps()
+            props[:] = []
+            for polyData, color in surfaces:
+                mapper = vtk.vtkPolyDataMapper()
+                mapper.SetInputData(polyData)
+                actor = vtk.vtkActor()
+                actor.SetMapper(mapper)
+                actor.GetProperty().SetColor(*color)
+                actor.GetProperty().SetOpacity(MIP_OVERLAY_SEGMENT_OPACITY)
+                renderer.AddViewProp(actor)
+                props.append(actor)
+            for _, center, text, _ in entries:
+                actor = self._textActor(text, center)
+                renderer.AddViewProp(actor)
+                props.append(actor)
+            view.scheduleRender()
+
+
 class Easy_fusionLogic(ScriptedLoadableModuleLogic):
 
     # --- Views -------------------------------------------------------------
@@ -1765,6 +2002,32 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         for vrDisplayNode in slicer.util.getNodesByClass("vtkMRMLVolumeRenderingDisplayNode"):
             if vrDisplayNode.GetVolumeNodeID() != volumeNode.GetID() and vrDisplayNode.GetVisibility():
                 vrDisplayNode.SetVisibility(False)
+
+    @staticmethod
+    def setMIPRange(vrDisplayNode, lower, upper, flatOpacity=False):
+        """MIP shows white at `lower` to black at `upper`. flatOpacity: every intensity fully opaque (set by Go)."""
+        propertyNode = vrDisplayNode.GetVolumePropertyNode() if vrDisplayNode is not None else None
+        if propertyNode is None:
+            return
+        colorFunction = propertyNode.GetVolumeProperty().GetRGBTransferFunction(0)
+        colorFunction.RemoveAllPoints()
+        colorFunction.AddRGBPoint(lower, 1.0, 1.0, 1.0)
+        colorFunction.AddRGBPoint(upper, 0.0, 0.0, 0.0)
+        if flatOpacity:
+            scalarOpacity = propertyNode.GetScalarOpacity()
+            scalarOpacity.RemoveAllPoints()
+            scalarOpacity.AddPoint(lower, 1.0)
+            scalarOpacity.AddPoint(upper, 1.0)
+        propertyNode.Modified()
+        vrDisplayNode.Modified()
+
+    @staticmethod
+    def getVolumeMaximum(volumeNode):
+        """Highest voxel value (e.g. SPECT counts) of a volume; 0 if it has no image data."""
+        imageData = volumeNode.GetImageData() if volumeNode is not None else None
+        if imageData is None or imageData.GetNumberOfPoints() == 0:
+            return 0.0
+        return float(imageData.GetScalarRange()[1])
 
     # --- Layouts and view contents ------------------------------------------
 
@@ -1798,6 +2061,32 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             layoutNode.SetViewArrangement(arrangement)
 
     @staticmethod
+    def viewUnderCursor():
+        """
+        ("slice", slice view name) or ("threeD", None) for the view under the mouse, in any window (so the
+        Monitor 2 window too); None when the mouse is not over a view.
+        """
+        widget = qt.QApplication.widgetAt(qt.QCursor.pos())
+        while widget is not None:
+            if widget.inherits("qMRMLThreeDWidget"):
+                return ("threeD", None)
+            if widget.inherits("qMRMLSliceWidget"):
+                return ("slice", Easy_fusionLogic._sliceViewName(widget))
+            widget = widget.parentWidget()
+        return None
+
+    @staticmethod
+    def _sliceViewName(sliceWidget):
+        try:
+            return sliceWidget.mrmlSliceNode().GetLayoutName()
+        except Exception:
+            layoutManager = slicer.app.layoutManager()
+            if layoutManager is None:
+                return None
+            return next((name for name in layoutManager.sliceViewNames()
+                         if layoutManager.sliceWidget(name) == sliceWidget), None)
+
+    @staticmethod
     def getSettingsNode(create=True):
         """Saved with the scene: remembers which PET and CT the views were built from."""
         node = slicer.mrmlScene.GetSingletonNode(SETTINGS_NODE_TAG, "vtkMRMLScriptedModuleNode")
@@ -1827,6 +2116,50 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             sliceNode.SetOrientation(orientation)
         else:
             getattr(sliceNode, f"SetOrientationTo{orientation}")()
+
+    @staticmethod
+    def roleSliceWidgets(visibleOnly=False):
+        """(name, slice widget) of every EasyFusion slice view (SLICE_VIEW_ROLES) in the current layout."""
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return []
+        widgets = []
+        for name in layoutManager.sliceViewNames():
+            if name not in SLICE_VIEW_ROLES:
+                continue
+            sliceWidget = layoutManager.sliceWidget(name)
+            if sliceWidget is None or (visibleOnly and not sliceWidget.visible):
+                continue
+            sliceNode = sliceWidget.mrmlSliceNode()
+            if sliceNode is None or not slicer.mrmlScene.IsNodePresent(sliceNode):
+                continue  # widget left over from a previous layout / scene
+            widgets.append((name, sliceWidget))
+        return widgets
+
+    @staticmethod
+    def roleSliceNodes():
+        """
+        (name, slice node, slice composite node) of every EasyFusion view that exists in the scene.
+        Works on MRML nodes only, so it is safe while the layout manager is creating or deleting view widgets.
+        """
+        scene = slicer.mrmlScene
+        result = []
+        for name in SLICE_VIEW_ROLES:
+            sliceNode = scene.GetSingletonNode(name, "vtkMRMLSliceNode")
+            compositeNode = scene.GetSingletonNode(name, "vtkMRMLSliceCompositeNode")
+            if sliceNode is not None and compositeNode is not None:
+                result.append((name, sliceNode, compositeNode))
+        return result
+
+    @staticmethod
+    def _addWithFixedID(node, nodeID):
+        """Add a node under nodeID when that ID is free (otherwise the scene picks one as usual)."""
+        if slicer.mrmlScene.GetNodeByID(nodeID) is None:
+            try:
+                node.SetID(nodeID)
+            except Exception:
+                pass  # older Slicer: fall back to an automatic ID
+        return slicer.mrmlScene.AddNode(node)
 
     @staticmethod
     def copySliceGeometry(source, target):
@@ -1870,10 +2203,10 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             node.SetNodeReferenceID(PET_ONLY_SOURCE_ROLE, petNode.GetID())
             displayNode = slicer.vtkMRMLScalarVolumeDisplayNode()
             displayNode.SetSaveWithScene(False)
-            slicer.mrmlScene.AddNode(displayNode)
+            displayNode = self._addWithFixedID(displayNode, PET_ONLY_DISPLAY_ID)
             self._configurePetOnlyDisplay(displayNode, petNode)
             node.SetAndObserveDisplayNodeID(displayNode.GetID())
-            slicer.mrmlScene.AddNode(node)
+            node = self._addWithFixedID(node, PET_ONLY_VOLUME_ID)
         else:
             node.SetName(f"{petNode.GetName()} (PET only)")
             node.CopyOrientation(petNode)
@@ -1885,7 +2218,7 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             if node.GetDisplayNode() is None:
                 displayNode = slicer.vtkMRMLScalarVolumeDisplayNode()
                 displayNode.SetSaveWithScene(False)
-                slicer.mrmlScene.AddNode(displayNode)
+                displayNode = self._addWithFixedID(displayNode, PET_ONLY_DISPLAY_ID)
                 node.SetAndObserveDisplayNodeID(displayNode.GetID())
             self._configurePetOnlyDisplay(node.GetDisplayNode(), petNode)
 
@@ -1949,29 +2282,34 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
 
     def applyViewRoles(self, petNode, ctNode, forceOrientation=False):
         """
-        Fill every existing EasyFusion slice view according to SLICE_VIEW_ROLES.
-        Returns the names of views whose background volume changed (those get re-fitted).
+        Fill every EasyFusion slice view according to SLICE_VIEW_ROLES (also views not in the current layout,
+        so switching layouts later shows the right content). Only MRML nodes are touched; the views follow.
+        Returns the names of views whose background volume or orientation changed (those get re-fitted).
         """
-        layoutManager = slicer.app.layoutManager()
-        if layoutManager is None or petNode is None or ctNode is None:
+        if petNode is None or ctNode is None or sceneIsBusy():
             return []
         petOnlyNode = self.getOrCreatePetOnlyVolume(petNode)
+        roleNodes = self.roleSliceNodes()
 
-        roleWidgets = []
-        for name in layoutManager.sliceViewNames():
-            if name in SLICE_VIEW_ROLES and layoutManager.sliceWidget(name) is not None:
-                roleWidgets.append((name, layoutManager.sliceWidget(name)))
-
-        # Unlink first: linked views copy volume selection to each other and would undo the assignment
-        for _, sliceWidget in roleWidgets:
-            compositeNode = sliceWidget.mrmlSliceCompositeNode()
+        # Unlink while assigning, so linked views cannot copy volume selections to each other. If the views
+        # were linked (Slicer's view-link button, used for scroll / pan / zoom sync), link them all again after.
+        compositeNodes = [compositeNode for _, _, compositeNode in roleNodes]
+        wasLinked = any(compositeNode.GetLinkedControl() for compositeNode in compositeNodes)
+        for compositeNode in compositeNodes:
             if compositeNode.GetLinkedControl():
                 compositeNode.SetLinkedControl(False)
+        try:
+            return self._assignViewVolumes(roleNodes, petNode, ctNode, petOnlyNode, forceOrientation)
+        finally:
+            if wasLinked:
+                for compositeNode in compositeNodes:
+                    compositeNode.SetLinkedControl(True)
 
+    def _assignViewVolumes(self, roleNodes, petNode, ctNode, petOnlyNode, forceOrientation):
+        """Orientation and background / foreground volumes of each EasyFusion view (see applyViewRoles)."""
         changedViews = []
-        for name, sliceWidget in roleWidgets:
+        for name, sliceNode, compositeNode in roleNodes:
             orientation, content = SLICE_VIEW_ROLES[name]
-            sliceNode = sliceWidget.mrmlSliceNode()
             if forceOrientation and self.getSliceOrientation(sliceNode) != orientation:
                 self.setSliceOrientation(sliceNode, orientation)
                 changedViews.append(name)
@@ -1985,7 +2323,6 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             if background is None:
                 continue
 
-            compositeNode = sliceWidget.mrmlSliceCompositeNode()
             wasModifying = compositeNode.StartModify()
             if compositeNode.GetBackgroundVolumeID() != background.GetID():
                 compositeNode.SetBackgroundVolumeID(background.GetID())
@@ -2001,8 +2338,8 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
 
     def restoreViewRolesAfterLoad(self):
         """PET-only views reference the unsaved twin volume, so rebuild them when a saved EasyFusion layout is loaded."""
-        layoutManager = slicer.app.layoutManager()
-        if layoutManager is None or layoutManager.layout not in CUSTOM_LAYOUT_IDS:
+        layoutNode = slicer.mrmlScene.GetSingletonNode("vtkMRMLLayoutNode", "vtkMRMLLayoutNode")
+        if layoutNode is None or layoutNode.GetViewArrangement() not in CUSTOM_LAYOUT_IDS:
             return
         settingsNode = self.getSettingsNode(create=False)
         if settingsNode is None:
@@ -2166,14 +2503,25 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         return number
 
     @staticmethod
+    def getRoiColor(node, pointID):
+        """Random color picked once per ROI and stored on the ROI list node, so it survives save / reload."""
+        color = parseRoiColor(node.GetAttribute(ROI_COLOR_ATTRIBUTE + pointID))
+        if color is None:
+            color = randomRoiColor()
+            node.SetAttribute(ROI_COLOR_ATTRIBUTE + pointID, " ".join(f"{c:.4f}" for c in color))
+        return color
+
+    @staticmethod
     def forgetRoi(node, pointID):
         node.RemoveAttribute(ROI_RADIUS_ATTRIBUTE + pointID)
         node.RemoveAttribute(ROI_NUMBER_ATTRIBUTE + pointID)
+        node.RemoveAttribute(ROI_COLOR_ATTRIBUTE + pointID)
 
     @staticmethod
     def forgetAllRois(node):
         for name in list(node.GetAttributeNames()):
-            if name.startswith(ROI_RADIUS_ATTRIBUTE) or name.startswith(ROI_NUMBER_ATTRIBUTE):
+            if (name.startswith(ROI_RADIUS_ATTRIBUTE) or name.startswith(ROI_NUMBER_ATTRIBUTE)
+                    or name.startswith(ROI_COLOR_ATTRIBUTE)):
                 node.RemoveAttribute(name)
         node.SetAttribute(ROI_NEXT_NUMBER_ATTRIBUTE, "1")
 
@@ -2261,8 +2609,26 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         if handlesNode is not None:
             slicer.mrmlScene.RemoveNode(handlesNode)
 
+    @staticmethod
+    def styleRoiSphereDisplayNode(displayNode):
+        """Sphere outlines take each ROI's own color from the RGB point scalars (also for older saved scenes)."""
+        if displayNode.GetSliceIntersectionThickness() != ROI_SPHERE_OUTLINE_PX:
+            displayNode.SetSliceIntersectionThickness(ROI_SPHERE_OUTLINE_PX)
+        directMapping = getattr(slicer.vtkMRMLDisplayNode, "UseDirectMapping", None)
+        if directMapping is None:
+            return  # very old Slicer: single color outlines
+        if displayNode.GetActiveScalarName() != ROI_SPHERE_COLOR_ARRAY:
+            displayNode.SetActiveScalar(ROI_SPHERE_COLOR_ARRAY, vtk.vtkAssignAttribute.POINT_DATA)
+        if displayNode.GetScalarRangeFlag() != directMapping:
+            displayNode.SetScalarRangeFlag(directMapping)
+        if not displayNode.GetScalarVisibility():
+            displayNode.SetScalarVisibility(True)
+
     def updateRoiSphereModel(self, spheres):
-        """One model holding all spheres; its slice intersections draw the ROI circles in 2D views."""
+        """
+        One model holding all spheres; its slice intersections draw the ROI circles in 2D views.
+        spheres: list of (center, radius, color). Each sphere carries its ROI color as RGB point scalars.
+        """
         modelNode = self.findRoiModelNode()
         if not spheres:
             if modelNode is not None:
@@ -2280,18 +2646,27 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             else:
                 displayNode.SetSliceIntersectionVisibility(True)
         displayNode = modelNode.GetDisplayNode()
-        if displayNode is not None and displayNode.GetSliceIntersectionThickness() != ROI_SPHERE_OUTLINE_PX:
-            displayNode.SetSliceIntersectionThickness(ROI_SPHERE_OUTLINE_PX)
+        if displayNode is not None:
+            self.styleRoiSphereDisplayNode(displayNode)
 
         append = vtk.vtkAppendPolyData()
-        for center, radius in spheres:
+        for center, radius, color in spheres:
             sphere = vtk.vtkSphereSource()
             sphere.SetCenter(center)
             sphere.SetRadius(radius)
             sphere.SetThetaResolution(48)
             sphere.SetPhiResolution(24)
             sphere.Update()
-            append.AddInputData(sphere.GetOutput())
+            spherePolyData = vtk.vtkPolyData()
+            spherePolyData.DeepCopy(sphere.GetOutput())
+            colors = vtk.vtkUnsignedCharArray()
+            colors.SetName(ROI_SPHERE_COLOR_ARRAY)
+            colors.SetNumberOfComponents(3)
+            rgb = [int(round(255 * c)) for c in color]
+            for _ in range(spherePolyData.GetNumberOfPoints()):
+                colors.InsertNextTuple3(*rgb)
+            spherePolyData.GetPointData().AddArray(colors)
+            append.AddInputData(spherePolyData)
         append.Update()
         polyData = vtk.vtkPolyData()
         polyData.DeepCopy(append.GetOutput())
@@ -2416,6 +2791,19 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         displayNode.SetVisibility3D(False)
         displayNode.EndModify(wasModifying)
 
+    @staticmethod
+    def ensureUnsmoothedClosedSurface(segmentationNode):
+        """Closed surface (3D) without smoothing; rebuilt once if it was made with other settings (older scenes)."""
+        segmentation = segmentationNode.GetSegmentation()
+        smoothingChanged = segmentation.GetConversionParameter("Smoothing factor") != SEGMENT_SURFACE_SMOOTHING
+        if smoothingChanged:
+            segmentation.SetConversionParameter("Smoothing factor", SEGMENT_SURFACE_SMOOTHING)
+        if not hasattr(segmentationNode, "CreateClosedSurfaceRepresentation"):
+            return
+        if smoothingChanged and hasattr(segmentationNode, "RemoveClosedSurfaceRepresentation"):
+            segmentationNode.RemoveClosedSurfaceRepresentation()
+        segmentationNode.CreateClosedSurfaceRepresentation()
+
     def getOrCreateRoiSegmentationNode(self, petNode):
         segmentationNode = self.findRoiSegmentationNode()
         if segmentationNode is None:
@@ -2448,7 +2836,7 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         slicer.vtkSlicerSegmentationsModuleLogic.SetBinaryLabelmapToSegment(labelmap, segmentationNode, segmentID, mode)
 
     def updateRoiSegments(self, entries, petNode):
-        """entries: list of (roiPointID, name, stats, unchanged). One segment per ROI, removed with the ROI."""
+        """entries: list of (roiPointID, name, stats, unchanged, color). One segment per ROI, removed with the ROI."""
         segmentationNode = self.findRoiSegmentationNode()
         if petNode is None or petNode.GetImageData() is None:
             return
@@ -2458,15 +2846,18 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         segmentation = segmentationNode.GetSegmentation()
 
         wantedIDs = set()
-        for roiID, name, stats, unchanged in entries:
+        for roiID, name, stats, unchanged, color in entries:
             segmentID = ROI_SEGMENT_ID_PREFIX + roiID
             wantedIDs.add(segmentID)
             segment = segmentation.GetSegment(segmentID)
             if segment is None:
-                segmentation.AddEmptySegment(segmentID, name, list(ROI_SEGMENT_COLOR))
+                segmentation.AddEmptySegment(segmentID, name, list(color))
                 unchanged = False
-            elif segment.GetName() != name:
-                segment.SetName(name)
+            else:
+                if segment.GetName() != name:
+                    segment.SetName(name)
+                if any(abs(a - b) > 1e-3 for a, b in zip(segment.GetColor(), color)):
+                    segment.SetColor(*color)
             if unchanged:
                 continue  # same ROI, PET and threshold as last time: segment is already up to date
             if stats is None:
