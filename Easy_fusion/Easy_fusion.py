@@ -28,6 +28,31 @@ ROI_PET_REFERENCE_ROLE = "EasyFusionPETVolume"
 ROI_HANDLES_ATTRIBUTE = "EasyFusion.SUVROIRadiusHandles"
 DEFAULT_ROI_RADIUS_MM = 15.0
 
+# One segment per ROI: voxels inside the sphere at or above the threshold (MTV / TLG)
+ROI_SEGMENTATION_ATTRIBUTE = "EasyFusion.SUVROISegmentation"
+ROI_SEGMENTATION_PET_ROLE = "EasyFusionSegmentationPET"
+ROI_SEGMENT_ID_PREFIX = "EFROI_"
+ROI_SEGMENT_COLOR = (0.0, 0.85, 1.0)
+ROI_SEGMENT_OUTLINE_PX = 2
+THRESHOLD_RELATIVE = "relative"   # % of the ROI's SUVmax
+THRESHOLD_ABSOLUTE = "absolute"   # fixed SUV value
+DEFAULT_RELATIVE_THRESHOLD = 40.0
+DEFAULT_ABSOLUTE_THRESHOLD = 2.5
+SETTINGS_THRESHOLD_MODE = "EasyFusion.ThresholdMode"
+SETTINGS_RELATIVE_THRESHOLD = "EasyFusion.RelativeThreshold"
+SETTINGS_ABSOLUTE_THRESHOLD = "EasyFusion.AbsoluteThreshold"
+
+# ROI appearance
+ROI_SPHERE_OUTLINE_PX = 1
+ROI_HANDLE_GLYPH_SCALE = 1.4
+ROI_LABEL_TEXT_SCALE = 2.5
+
+# SUV text is drawn by a separate, locked label layer so it can be white and sit one radius
+# away from the center. One anchor per ROI lies in only one of the three standard planes, on the
+# screen's upper-right diagonal of that view: axial (-R,+A), coronal (-R,+S), sagittal (-A,+S).
+ROI_LABELS_ATTRIBUTE = "EasyFusion.SUVROILabels"
+LABEL_ANCHOR_DIRECTIONS = [(-1.0, 1.0, 0.0), (-1.0, 0.0, 1.0), (0.0, -1.0, 1.0)]
+
 # Radius handles sit on each sphere along ±R, ±A, ±S, so every slice view through the
 # ROI center shows four of them around the circle.
 HANDLE_DIRECTIONS = [(1.0, 0.0, 0.0), (-1.0, 0.0, 0.0),
@@ -146,7 +171,9 @@ class Easy_fusion(ScriptedLoadableModule):
         parent.contributors = ["Burak Demir, MD, FEBNM"]
         parent.helpText = """
         This module provides easy fusion of SPECT/PET and CT/MR images.
-        Spherical ROIs report SUVmax and SUVmean, read directly from the selected PET volume
+        Spherical ROIs report SUVmax and SUVmean, plus a thresholded segment inside each ROI
+        (default 40% of SUVmax, or an absolute SUV) giving segment SUVmean, MTV and TLG. Values are read
+        directly from the selected PET volume
         (the volume is assumed to already be in SUV units). Press Insert over a slice view to drop
         an ROI at the cursor; drag the yellow edge handles to resize it.
         Layout buttons switch between four-up, axial fusion/CT/PET, 2x3 + 3D and a dual monitor layout
@@ -173,49 +200,80 @@ _sceneObserverTags = []
 
 
 def registerSceneObservers():
-    """Observe scene loading so saved scenes come back in a consistent state. Safe to call repeatedly."""
+    """
+    Observe scene loading so saved scenes come back in a consistent state. Safe to call repeatedly.
+    Layouts are registered once here (at startup); Slicer keeps them across scene close/load, so
+    nothing touches the layout node while a scene is being loaded.
+    """
     if _sceneObserverTags:
         return
     scene = slicer.mrmlScene
-    _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.StartImportEvent, _onSceneStartImport))
+    _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.StartCloseEvent, _onSceneStartClose))
     _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.EndImportEvent, _onSceneEndImport))
-    _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.EndCloseEvent, _onSceneEndClose))
-    _ensureLayoutsRegisteredSafely()
-
-
-def _ensureLayoutsRegisteredSafely():
+    _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.StartSaveEvent, _onSceneStartSave))
+    _sceneObserverTags.append(scene.AddObserver(slicer.vtkMRMLScene.EndSaveEvent, _onSceneEndSave))
     try:
         Easy_fusionLogic.ensureLayoutsRegistered()
+        Easy_fusionLogic.reapplyRestoredCustomLayout()
     except Exception:
         logging.exception("EasyFusion: could not register layouts")
 
 
-def _onSceneStartImport(caller, event):
-    # A saved scene may use an EasyFusion layout; its description must exist before the layout is restored
-    _ensureLayoutsRegisteredSafely()
+def sceneIsBusy():
+    scene = slicer.mrmlScene
+    return scene.IsImporting() or scene.IsClosing() or scene.IsBatchProcessing()
 
 
-def _onSceneEndClose(caller, event):
+def callWhenSceneIdle(callback, attemptsLeft=50):
+    """Run callback from the event loop once the scene has finished loading/closing (views are rebuilt by then)."""
+    if sceneIsBusy() and attemptsLeft > 0:
+        qt.QTimer.singleShot(100, lambda: callWhenSceneIdle(callback, attemptsLeft - 1))
+        return
+    try:
+        callback()
+    except Exception:
+        logging.exception("EasyFusion: deferred scene update failed")
+
+
+def _onSceneStartClose(caller, event):
     unbindWindowLevelSync()
-    _ensureLayoutsRegisteredSafely()
+
+
+# While a scene file is written, PET-only views point at the real PET instead of the unsaved twin,
+# so saved scenes never reference a node ID that does not exist in the file.
+_saveSwaps = []
+
+
+def _onSceneStartSave(caller, event):
+    try:
+        _saveSwaps[:] = Easy_fusionLogic.pointPetOnlyViewsAtSourcePet()
+    except Exception:
+        logging.exception("EasyFusion: could not prepare PET-only views for saving")
+
+
+def _onSceneEndSave(caller, event):
+    try:
+        Easy_fusionLogic.restorePetOnlyViews(_saveSwaps)
+    except Exception:
+        logging.exception("EasyFusion: could not restore PET-only views after saving")
+    finally:
+        _saveSwaps[:] = []
 
 
 def _onSceneEndImport(caller, event):
-    try:
-        logic = Easy_fusionLogic()
-        logic.stopAllViewRotations()
-        logic.repairHotIronColorNodes()
-    except Exception:
-        logging.exception("EasyFusion: post-load scene repair failed")
-    # Deferred so the restored layout has created its views first
-    qt.QTimer.singleShot(0, _restoreViewRolesAfterLoad)
+    # Nothing is changed inside the import notification itself: the layout manager may still be
+    # rebuilding views for the loaded layout. All repairs run afterwards from the event loop.
+    qt.QTimer.singleShot(0, lambda: callWhenSceneIdle(_afterSceneLoad))
 
 
-def _restoreViewRolesAfterLoad():
-    try:
-        Easy_fusionLogic().restoreViewRolesAfterLoad()
-    except Exception:
-        logging.exception("EasyFusion: could not restore view contents after scene load")
+def _afterSceneLoad():
+    logic = Easy_fusionLogic()
+    # First, before anything creates nodes: scenes saved by earlier versions contain views that refer to
+    # the unsaved PET-only twin by ID. A new node given that ID would be picked up half-built.
+    logic.clearDanglingViewReferences()
+    logic.stopAllViewRotations()
+    logic.repairHotIronColorNodes()
+    logic.restoreViewRolesAfterLoad()
 
 
 # PET window/level is kept identical between the fusion PET and its PET-only (inverted grey) twin.
@@ -280,16 +338,21 @@ def hotIronRGB(t):
     return (min(max(r, 0.0), 1.0), min(max(g, 0.0), 1.0), min(max(b, 0.0), 1.0))
 
 
-def sphereStatisticsFromArray(voxels, ijkToRas, centerRas, radiusMm):
+def sphereStatisticsFromArray(voxels, ijkToRas, centerRas, radiusMm,
+                              thresholdMode=THRESHOLD_RELATIVE, thresholdValue=DEFAULT_RELATIVE_THRESHOLD):
     """
-    Statistics of all voxels whose centers lie inside a sphere.
+    Statistics of the voxels whose centers lie inside a sphere, plus a thresholded segment inside it.
 
     voxels:    numpy array indexed [k, j, i] (as returned by slicer.util.arrayFromVolume)
     ijkToRas:  4x4 matrix (numpy) mapping voxel indices to RAS (mm)
     centerRas: sphere center in the volume's RAS coordinate system
     radiusMm:  sphere radius in mm
+    thresholdMode / thresholdValue: THRESHOLD_RELATIVE (% of SUVmax in the sphere) or THRESHOLD_ABSOLUTE (SUV)
 
-    Returns dict(max, mean, voxels, volumeMl) or None if the sphere does not touch the volume.
+    Returns None if the sphere does not touch the volume, otherwise a dict with
+      max, mean, voxels, volumeMl           (whole sphere)
+      threshold, segVoxels, segMean, mtvMl, tlg  (segment; segMean is None if the segment is empty)
+      extent (i0, i1, j0, j1, k0, k1) and segMask (bool array [k, j, i] over that extent)
     If the sphere is smaller than a voxel, the voxel containing the center is used.
     """
     voxels = np.asarray(voxels)
@@ -309,33 +372,53 @@ def sphereStatisticsFromArray(voxels, ijkToRas, centerRas, radiusMm):
     lo = np.maximum(np.floor(centerIjk).astype(int) - reach, 0)
     hi = np.minimum(np.ceil(centerIjk).astype(int) + reach, dims - 1)
 
-    collected = []
+    inside = None
     if np.all(lo <= hi):
+        ni, nj, nk = (hi - lo + 1)
         jj, ii = np.meshgrid(np.arange(lo[1], hi[1] + 1), np.arange(lo[0], hi[0] + 1), indexing="ij")
-        iFlat, jFlat = ii.ravel(), jj.ravel()
-        inPlane = linear[:, 0:1] * iFlat + linear[:, 1:2] * jFlat + offset[:, None]
+        inPlane = linear[:, 0:1] * ii.ravel() + linear[:, 1:2] * jj.ravel() + offset[:, None]
         radius2 = radius * radius
-        for k in range(lo[2], hi[2] + 1):  # slab by slab keeps memory bounded for big spheres
-            ras = inPlane + linear[:, 2:3] * k
-            inside = np.einsum("ij,ij->j", ras - center[:, None], ras - center[:, None]) <= radius2
-            if inside.any():
-                collected.append(voxels[k][jFlat[inside], iFlat[inside]])
+        inside = np.zeros((nk, nj, ni), dtype=bool)
+        for kIndex in range(nk):  # slab by slab keeps memory bounded for big spheres
+            delta = inPlane + linear[:, 2:3] * (lo[2] + kIndex) - center[:, None]
+            inside[kIndex] = (np.einsum("ij,ij->j", delta, delta) <= radius2).reshape(nj, ni)
+        if not inside.any():
+            inside = None
 
-    if collected:
-        values = np.concatenate(collected)
-    else:
+    if inside is None:
         nearest = np.round(centerIjk).astype(int)
-        if np.all(nearest >= 0) and np.all(nearest < dims):
-            values = np.asarray(voxels[nearest[2], nearest[1], nearest[0]]).reshape(1)
-        else:
+        if not (np.all(nearest >= 0) and np.all(nearest < dims)):
             return None
+        lo = hi = nearest
+        inside = np.ones((1, 1, 1), dtype=bool)
 
+    sub = voxels[lo[2]:hi[2] + 1, lo[1]:hi[1] + 1, lo[0]:hi[0] + 1]
+    values = sub[inside]
     voxelVolumeMl = abs(np.linalg.det(linear)) / 1000.0
+    suvMax = float(values.max())
+
+    if thresholdMode == THRESHOLD_ABSOLUTE:
+        threshold = float(thresholdValue)
+    else:
+        threshold = suvMax * float(thresholdValue) / 100.0
+    segMask = inside & (sub >= threshold)
+    segValues = sub[segMask]
+    segVoxels = int(segValues.size)
+    segMean = float(segValues.mean()) if segVoxels else None
+    mtvMl = segVoxels * voxelVolumeMl
+
     return {
-        "max": float(values.max()),
+        "max": suvMax,
         "mean": float(values.mean()),
         "voxels": int(values.size),
         "volumeMl": float(values.size * voxelVolumeMl),
+        "threshold": threshold,
+        "segVoxels": segVoxels,
+        "segMean": segMean,
+        "mtvMl": float(mtvMl),
+        "tlg": float(segMean * mtvMl) if segVoxels else 0.0,
+        "extent": (int(lo[0]), int(hi[0]), int(lo[1]), int(hi[1]), int(lo[2]), int(hi[2])),
+        "segMask": segMask,
     }
 
 
@@ -344,6 +427,19 @@ def formatRoiLabel(name, stats, hasPet):
     if stats is None:
         return f"{name}\n(outside PET)" if hasPet else f"{name}\n(no PET)"
     return f"{name}\nSUVmax {stats['max']:.2f}\nSUVmean {stats['mean']:.2f}"
+
+
+def formatRoiTableRow(name, radius, stats):
+    """ROI | r (mm) | SUVmax | SUVmean | Seg SUVmean | MTV (mL) | TLG"""
+    values = [name, f"{radius:.1f}", "-", "-", "-", "-", "-"]
+    if stats is not None:
+        values[2] = f"{stats['max']:.2f}"
+        values[3] = f"{stats['mean']:.2f}"
+        if stats.get("segMean") is not None:
+            values[4] = f"{stats['segMean']:.2f}"
+        values[5] = f"{stats.get('mtvMl', 0.0):.2f}"
+        values[6] = f"{stats.get('tlg', 0.0):.2f}"
+    return values
 
 
 def _distance(a, b):
@@ -357,15 +453,22 @@ def radiusHandlePosition(center, radius, axis):
             center[2] + direction[2] * radius]
 
 
-def parseHandleDescription(description):
-    """Handle control points store '<roi control point ID>:<axis>' in their description."""
+def parseHandleDescription(description, count=len(HANDLE_DIRECTIONS)):
+    """Handle / label anchor points store '<roi control point ID>:<index>' in their description."""
     if not description or ":" not in description:
         return None
-    roiID, _, axisText = description.rpartition(":")
-    if not roiID or not axisText.isdigit():
+    roiID, _, indexText = description.rpartition(":")
+    if not roiID or not indexText.isdigit():
         return None
-    axis = int(axisText)
-    return (roiID, axis) if 0 <= axis < len(HANDLE_DIRECTIONS) else None
+    index = int(indexText)
+    return (roiID, index) if 0 <= index < count else None
+
+
+def labelAnchorPosition(center, radius, plane):
+    """Label anchor one radius away from the center, on the upper-right diagonal of that plane's view."""
+    direction = LABEL_ANCHOR_DIRECTIONS[plane]
+    scale = float(radius) / np.sqrt(2.0)
+    return [center[i] + direction[i] * scale for i in range(3)]
 
 
 def resolveHandleDrag(center, radius, lastGeometry, handles, activeHandleID, tolerance=1e-3):
@@ -605,6 +708,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # Observers
         registerSceneObservers()  # in case the module was added after startup
+        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndImportEvent, self.onSceneEndImport)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.NodeAboutToBeRemovedEvent, self.onNodeAboutToBeRemoved)
@@ -613,7 +717,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.app.layoutManager().connect("layoutChanged(int)", self.onLayoutChanged)
 
         self.observeThreeDViewNode()
-        self.restoreSelectorsFromSettings()
+        self.restoreFromSettings()
         self.connectToExistingRois()
         self.onLayoutChanged()
 
@@ -685,16 +789,40 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         roiButtonsLayout.addWidget(self.clearRoisButton)
         measurementLayout.addRow(roiButtonsLayout)
 
+        thresholdLayout = qt.QHBoxLayout()
+        self.thresholdModeComboBox = qt.QComboBox()
+        self.thresholdModeComboBox.addItem("% of SUVmax", THRESHOLD_RELATIVE)
+        self.thresholdModeComboBox.addItem("Absolute SUV", THRESHOLD_ABSOLUTE)
+        self.thresholdModeComboBox.setToolTip(
+            "Relative: segment = voxels inside the ROI with SUV >= this % of the ROI's SUVmax.\n"
+            "Absolute: segment = voxels inside the ROI with SUV >= this value.")
+        self.thresholdValueSpinBox = qt.QDoubleSpinBox()
+        self.thresholdValueSpinBox.setDecimals(1)
+        thresholdLayout.addWidget(self.thresholdModeComboBox)
+        thresholdLayout.addWidget(self.thresholdValueSpinBox)
+        measurementLayout.addRow("Segment threshold:", thresholdLayout)
+        self._relativeThreshold = DEFAULT_RELATIVE_THRESHOLD
+        self._absoluteThreshold = DEFAULT_ABSOLUTE_THRESHOLD
+        self._applyThresholdModeToSpinBox(THRESHOLD_RELATIVE)
+
         self.roiPetLabel = qt.QLabel("Measuring on: (no PET selected)")
         measurementLayout.addRow(self.roiPetLabel)
 
         self.roiTable = qt.QTableWidget()
-        self.roiTable.setColumnCount(5)
-        self.roiTable.setHorizontalHeaderLabels(["ROI", "Radius (mm)", "SUVmax", "SUVmean", "Volume (mL)"])
+        self.roiTable.setColumnCount(7)
+        self.roiTable.setHorizontalHeaderLabels(["ROI", "r (mm)", "SUVmax", "SUVmean", "Seg SUVmean", "MTV (mL)", "TLG"])
+        headerTips = ["", "ROI radius", "Maximum SUV inside the ROI sphere", "Mean SUV of the whole ROI sphere",
+                      "Mean SUV of the thresholded segment", "Metabolic tumor volume: volume of the thresholded segment",
+                      "Total lesion glycolysis = Seg SUVmean x MTV"]
+        for column, tip in enumerate(headerTips):
+            headerItem = self.roiTable.horizontalHeaderItem(column)
+            if headerItem is not None and tip:
+                headerItem.setToolTip(tip)
         self.roiTable.setEditTriggers(qt.QAbstractItemView.NoEditTriggers)
         self.roiTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
         self.roiTable.setSelectionMode(qt.QAbstractItemView.SingleSelection)
-        self.roiTable.horizontalHeader().setSectionResizeMode(qt.QHeaderView.Stretch)
+        self.roiTable.horizontalHeader().setSectionResizeMode(qt.QHeaderView.ResizeToContents)
+        self.roiTable.horizontalHeader().setStretchLastSection(True)
         self.roiTable.verticalHeader().setVisible(False)
         self.roiTable.setMinimumHeight(140)
         self.roiTable.setToolTip("Select a row to jump the slice views to that ROI.")
@@ -705,6 +833,8 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.clearRoisButton.connect('clicked()', self.onClearRois)
         self.roiRadiusSpinBox.connect('valueChanged(double)', self.onRoiRadiusChanged)
         self.roiTable.connect('itemSelectionChanged()', self.onRoiSelectionChanged)
+        self.thresholdModeComboBox.connect('currentIndexChanged(int)', self.onThresholdModeChanged)
+        self.thresholdValueSpinBox.connect('valueChanged(double)', self.onThresholdValueChanged)
 
         # Batch rapid point events (e.g. dragging) into one recomputation
         self.roiUpdateTimer = qt.QTimer()
@@ -712,10 +842,12 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.roiUpdateTimer.setInterval(60)
         self.roiUpdateTimer.connect('timeout()', self.updateRois)
 
-        # Insert key: drop an ROI at the mouse cursor (works anywhere in the main window)
+        # Insert key: drop an ROI at the mouse cursor. Application-wide, because the Monitor 2 viewport
+        # is a separate window and a main-window shortcut stops working as soon as that window is active.
         mainWindow = slicer.util.mainWindow()
         if mainWindow is not None:
             self.placeRoiShortcut = qt.QShortcut(qt.QKeySequence(qt.Qt.Key_Insert), mainWindow)
+            self.placeRoiShortcut.setContext(qt.Qt.ApplicationShortcut)
             self.placeRoiShortcut.connect('activated()', self.onPlaceRoiAtCursor)
 
     def enter(self):
@@ -738,17 +870,25 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # Scene events
     # ------------------------------------------------------------------
 
+    def onSceneStartClose(self, caller=None, event=None):
+        # Drop references to view nodes before the scene (and possibly the layout) is torn down
+        self.removeObservers(self.onSliceNodeModified)
+
     def onSceneEndClose(self, caller=None, event=None):
         self.setRoiNode(None)
         self.setHandlesNode(None)
         self.fillRoiTable([])
-        self.observeThreeDViewNode()
+        qt.QTimer.singleShot(0, lambda: callWhenSceneIdle(self.refreshViewsAfterSceneChange))
 
     def onSceneEndImport(self, caller=None, event=None):
-        self.observeThreeDViewNode()
-        self.restoreSelectorsFromSettings()
+        self.restoreFromSettings()
         self.connectToExistingRois()
-        qt.QTimer.singleShot(0, self.onLayoutChanged)  # after the restored layout has built its views
+        # Views of a loaded layout are rebuilt by Slicer after this notification; touch them only afterwards
+        qt.QTimer.singleShot(0, lambda: callWhenSceneIdle(self.refreshViewsAfterSceneChange))
+
+    def refreshViewsAfterSceneChange(self):
+        self.observeThreeDViewNode()
+        self.onLayoutChanged()
 
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def onNodeAboutToBeRemoved(self, caller, event, node):
@@ -886,6 +1026,10 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onLayoutChanged(self, layoutID=None):
         if not hasattr(self, "layoutButtons"):
             return
+        if sceneIsBusy():
+            # Layout switches during scene loading: views are still being rebuilt, look at them later
+            qt.QTimer.singleShot(0, lambda: callWhenSceneIdle(self.onLayoutChanged))
+            return
         layoutManager = slicer.app.layoutManager()
         current = layoutManager.layout if layoutManager is not None else None
         self.layoutButtonGroup.setExclusive(False)
@@ -894,7 +1038,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.layoutButtonGroup.setExclusive(True)
         self.observeSliceViewsForSync()
 
-    def restoreSelectorsFromSettings(self):
+    def restoreFromSettings(self):
         settingsNode = self.logic.getSettingsNode(create=False)
         if settingsNode is None:
             return
@@ -905,10 +1049,73 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if ct is not None:
             self.inputVolumeSelectorCT.setCurrentNode(ct)
 
+        def readFloat(name, default):
+            try:
+                return float(settingsNode.GetAttribute(name))
+            except (TypeError, ValueError):
+                return default
+        self._relativeThreshold = readFloat(SETTINGS_RELATIVE_THRESHOLD, DEFAULT_RELATIVE_THRESHOLD)
+        self._absoluteThreshold = readFloat(SETTINGS_ABSOLUTE_THRESHOLD, DEFAULT_ABSOLUTE_THRESHOLD)
+        mode = settingsNode.GetAttribute(SETTINGS_THRESHOLD_MODE)
+        mode = mode if mode in (THRESHOLD_RELATIVE, THRESHOLD_ABSOLUTE) else THRESHOLD_RELATIVE
+        wasBlocked = self.thresholdModeComboBox.blockSignals(True)
+        self.thresholdModeComboBox.setCurrentIndex(self.thresholdModeComboBox.findData(mode))
+        self.thresholdModeComboBox.blockSignals(wasBlocked)
+        self._applyThresholdModeToSpinBox(mode)
+
+    # ------------------------------------------------------------------
+    # Segment threshold
+    # ------------------------------------------------------------------
+
+    def currentThreshold(self):
+        mode = self.thresholdModeComboBox.itemData(self.thresholdModeComboBox.currentIndex)
+        mode = mode if mode in (THRESHOLD_RELATIVE, THRESHOLD_ABSOLUTE) else THRESHOLD_RELATIVE
+        value = self._absoluteThreshold if mode == THRESHOLD_ABSOLUTE else self._relativeThreshold
+        return mode, value
+
+    def _applyThresholdModeToSpinBox(self, mode):
+        spinBox = self.thresholdValueSpinBox
+        wasBlocked = spinBox.blockSignals(True)
+        if mode == THRESHOLD_ABSOLUTE:
+            spinBox.setRange(0.0, 100.0)
+            spinBox.setSingleStep(0.1)
+            spinBox.setSuffix(" SUV")
+            spinBox.setValue(self._absoluteThreshold)
+        else:
+            spinBox.setRange(1.0, 100.0)
+            spinBox.setSingleStep(1.0)
+            spinBox.setSuffix(" %")
+            spinBox.setValue(self._relativeThreshold)
+        spinBox.blockSignals(wasBlocked)
+
+    def onThresholdModeChanged(self, index=None):
+        mode, _ = self.currentThreshold()
+        self._applyThresholdModeToSpinBox(mode)
+        self.saveThresholdSettings()
+        self.scheduleRoiUpdate()
+
+    def onThresholdValueChanged(self, value):
+        mode, _ = self.currentThreshold()
+        if mode == THRESHOLD_ABSOLUTE:
+            self._absoluteThreshold = float(value)
+        else:
+            self._relativeThreshold = float(value)
+        self.saveThresholdSettings()
+        self.scheduleRoiUpdate()
+
+    def saveThresholdSettings(self):
+        settingsNode = self.logic.getSettingsNode()
+        mode, _ = self.currentThreshold()
+        settingsNode.SetAttribute(SETTINGS_THRESHOLD_MODE, mode)
+        settingsNode.SetAttribute(SETTINGS_RELATIVE_THRESHOLD, f"{self._relativeThreshold:g}")
+        settingsNode.SetAttribute(SETTINGS_ABSOLUTE_THRESHOLD, f"{self._absoluteThreshold:g}")
+
     def _roleSliceWidgets(self, visibleOnly=False):
         layoutManager = slicer.app.layoutManager()
         widgets = []
         if layoutManager is None:
+            return widgets
+        if sceneIsBusy():
             return widgets
         for name in layoutManager.sliceViewNames():
             if name not in SLICE_VIEW_ROLES:
@@ -916,6 +1123,9 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             sliceWidget = layoutManager.sliceWidget(name)
             if sliceWidget is None or (visibleOnly and not sliceWidget.visible):
                 continue
+            sliceNode = sliceWidget.mrmlSliceNode()
+            if sliceNode is None or not slicer.mrmlScene.IsNodePresent(sliceNode):
+                continue  # widget left over from a previous layout / scene
             widgets.append((name, sliceWidget))
         return widgets
 
@@ -927,7 +1137,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onSliceNodeModified(self, caller, event=None):
         """Mirror user scrolling / panning / zooming to the other visible views with the same orientation."""
-        if self._syncingSlices or caller is None or not self.syncSliceViewsCheckBox.checked:
+        if self._syncingSlices or caller is None or not self.syncSliceViewsCheckBox.checked or sceneIsBusy():
             return
         if not caller.GetInteracting():
             return  # only user interaction; avoids feedback from resizes and programmatic changes
@@ -944,6 +1154,8 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def alignSliceViews(self, changedViews):
         """Fit views whose CT changed, then give same-orientation views the same position and zoom."""
+        if sceneIsBusy():
+            return
         groups = {}
         for name, sliceWidget in self._roleSliceWidgets(visibleOnly=True):
             groups.setdefault(self.logic.getSliceOrientation(sliceWidget.mrmlSliceNode()), []).append((name, sliceWidget))
@@ -1190,6 +1402,9 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.inputVolumeSelector.setCurrentNode(pet)
         self.setRoiNode(node)
         self.setHandlesNode(self.logic.findRoiHandlesNode())
+        if node is not None:
+            # Scenes saved with an earlier version showed SUV text on the center point itself
+            self.logic.styleRoiDisplayNode(node.GetDisplayNode())
         self.scheduleRoiUpdate()
 
     def onRoiNodeModified(self, caller=None, event=None):
@@ -1204,7 +1419,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if self._updatingRois:
             return
         scene = slicer.mrmlScene
-        if scene.IsImporting() or scene.IsClosing():
+        if sceneIsBusy():
             return  # scene event handlers trigger a refresh when done
 
         node = self.roiNode
@@ -1219,11 +1434,15 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.removeRoiSphereModel()
             self.setHandlesNode(None)
             self.logic.removeRoiHandlesNode()
+            self.logic.removeRoiLabelsNode()
+            self.logic.removeRoiSegmentationNode()
             self.fillRoiTable([])
             return
 
+        thresholdMode, thresholdValue = self.currentThreshold()
         selectedID = self.selectedRoiPointID()
         rows, spheres, newCache = [], [], {}
+        labelEntries, segmentEntries = [], []
         draggedRoiID = None
         self._updatingRois = True
         try:
@@ -1243,20 +1462,24 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 radius = self.logic.getRoiRadius(node, pointID, self.roiRadiusSpinBox.value)
                 number = self.logic.getRoiNumber(node, pointID)
 
-                key = self.logic.statsCacheKey(pet, center, radius)
-                if key in self._roiStatsCache:
+                key = self.logic.statsCacheKey(pet, center, radius, thresholdMode, thresholdValue)
+                unchanged = key in self._roiStatsCache
+                if unchanged:
                     stats = self._roiStatsCache[key]
                 else:
-                    stats = self.logic.computeSphereStatistics(pet, center, radius)
+                    stats = self.logic.computeSphereStatistics(pet, center, radius, thresholdMode, thresholdValue)
                 newCache[key] = stats
 
                 name = f"ROI-{number}"
-                label = formatRoiLabel(name, stats, pet is not None)
-                if node.GetNthControlPointLabel(index) != label:
-                    node.SetNthControlPointLabel(index, label)
+                # The center point keeps only the name (shown in the Markups module); the SUV text is
+                # drawn by the separate white label layer placed one radius away from the center.
+                if node.GetNthControlPointLabel(index) != name:
+                    node.SetNthControlPointLabel(index, name)
 
                 rows.append((pointID, name, radius, stats))
                 spheres.append((center, radius))
+                labelEntries.append((pointID, center, radius, formatRoiLabel(name, stats, pet is not None)))
+                segmentEntries.append((pointID, name, stats, unchanged))
 
             if pet is not None and rows and node.GetNodeReferenceID(ROI_PET_REFERENCE_ROLE) != pet.GetID():
                 node.SetNodeReferenceID(ROI_PET_REFERENCE_ROLE, pet.GetID())
@@ -1268,15 +1491,37 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Select a freshly placed ROI, or the one being resized, so the radius box follows it
         currentIDs = {row[0] for row in rows}
         newIDs = currentIDs - self._knownRoiIDs if self._knownRoiIDs is not None else set()
+        newRoiCenter = None
         if len(newIDs) == 1:
             selectedID = next(iter(newIDs))
+            newRoiCenter = next((center for _, pointID, center in rois if pointID == selectedID), None)
         elif draggedRoiID is not None:
             selectedID = draggedRoiID
         self._knownRoiIDs = currentIDs
 
         self.logic.updateRoiSphereModel(spheres)
+        self.logic.updateRoiLabels(labelEntries)
+        try:
+            self.logic.updateRoiSegments(segmentEntries, pet)
+        except Exception:
+            logging.exception("EasyFusion: could not update ROI segments")
         self.fillRoiTable(rows, selectedID)
         self.syncRadiusSpinBox(rows, selectedID)
+        if newRoiCenter is not None:
+            self.jumpSliceViewsTo(newRoiCenter)
+
+    @staticmethod
+    def jumpSliceViewsTo(positionWorld):
+        """
+        Bring every slice view (all orientations, CT-only / PET-only views, both monitors) to a position.
+        Offset jump: each view only changes its slice, it is not re-centered or panned, so the view the
+        ROI was placed in stays exactly where it is.
+        """
+        x, y, z = (float(v) for v in positionWorld)
+        try:
+            slicer.modules.markups.logic().JumpSlicesToLocation(x, y, z, False)
+        except Exception:
+            slicer.vtkMRMLSliceNode.JumpAllSlices(slicer.mrmlScene, x, y, z, slicer.vtkMRMLSliceNode.OffsetJumpSlice)
 
     def syncRadiusHandles(self, roiNode, rois):
         """
@@ -1296,6 +1541,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if handlesNode is None:
             self._lastRoiGeometry = {}
             return None
+        self.logic.styleRoiHandlesDisplayNode(handlesNode.GetDisplayNode())
 
         # Drop handles of deleted ROIs, stray points and duplicates
         roiIDs = {pointID for _, pointID, _ in rois}
@@ -1382,9 +1628,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         try:
             table.setRowCount(len(rows))
             for rowIndex, (pointID, name, radius, stats) in enumerate(rows):
-                values = [name, f"{radius:.1f}", "-", "-", "-"]
-                if stats is not None:
-                    values[2:] = [f"{stats['max']:.2f}", f"{stats['mean']:.2f}", f"{stats['volumeMl']:.2f}"]
+                values = formatRoiTableRow(name, radius, stats)
                 for column, text in enumerate(values):
                     item = qt.QTableWidgetItem(text)
                     if column == 0:
@@ -1531,11 +1775,27 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             return
         layoutNode = layoutManager.layoutLogic().GetLayoutNode()
         for layoutID, description in buildLayoutDescriptions().items():
-            if layoutNode.IsLayoutDescription(layoutID):
-                if layoutNode.GetLayoutDescription(layoutID) != description:
-                    layoutNode.SetLayoutDescription(layoutID, description)
-            else:
+            if not layoutNode.IsLayoutDescription(layoutID):
                 layoutNode.AddLayoutDescription(layoutID, description)
+            elif (layoutNode.GetLayoutDescription(layoutID) != description
+                  and layoutNode.GetViewArrangement() != layoutID):
+                # Rebuilding the layout that is on screen is never needed and is risky
+                layoutNode.SetLayoutDescription(layoutID, description)
+
+    @staticmethod
+    def reapplyRestoredCustomLayout():
+        """
+        Slicer restores the last used layout at startup, before modules can register their layouts. If that
+        was an Lvgvs layout, it was applied without a description. Re-applying the arrangement now that the
+        description exists is the same call Slicer's own vtkMRMLLayoutLogic makes for this situation.
+        """
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return
+        layoutNode = layoutManager.layoutLogic().GetLayoutNode()
+        arrangement = layoutNode.GetViewArrangement()
+        if arrangement in CUSTOM_LAYOUT_IDS:
+            layoutNode.SetViewArrangement(arrangement)
 
     @staticmethod
     def getSettingsNode(create=True):
@@ -1597,22 +1857,45 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             return None
         node = self.findPetOnlyVolume()
         if node is None:
-            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
+            # Build the twin completely *before* it enters the scene. Views may already refer to the ID the
+            # scene is about to hand out, and must never see a volume without image data or display node.
+            node = slicer.vtkMRMLScalarVolumeNode()
             node.SetAttribute(PET_ONLY_VOLUME_ATTRIBUTE, "1")
             node.SetHideFromEditors(True)
             node.SetSaveWithScene(False)
-        node.SetName(f"{petNode.GetName()} (PET only)")
-        node.CopyOrientation(petNode)
-        if node.GetImageData() is not petNode.GetImageData():
+            node.SetName(f"{petNode.GetName()} (PET only)")
+            node.CopyOrientation(petNode)
             node.SetAndObserveImageData(petNode.GetImageData())
-        if node.GetTransformNodeID() != petNode.GetTransformNodeID():
             node.SetAndObserveTransformNodeID(petNode.GetTransformNodeID())
-        node.SetNodeReferenceID(PET_ONLY_SOURCE_ROLE, petNode.GetID())
+            node.SetNodeReferenceID(PET_ONLY_SOURCE_ROLE, petNode.GetID())
+            displayNode = slicer.vtkMRMLScalarVolumeDisplayNode()
+            displayNode.SetSaveWithScene(False)
+            slicer.mrmlScene.AddNode(displayNode)
+            self._configurePetOnlyDisplay(displayNode, petNode)
+            node.SetAndObserveDisplayNodeID(displayNode.GetID())
+            slicer.mrmlScene.AddNode(node)
+        else:
+            node.SetName(f"{petNode.GetName()} (PET only)")
+            node.CopyOrientation(petNode)
+            if node.GetImageData() is not petNode.GetImageData():
+                node.SetAndObserveImageData(petNode.GetImageData())
+            if node.GetTransformNodeID() != petNode.GetTransformNodeID():
+                node.SetAndObserveTransformNodeID(petNode.GetTransformNodeID())
+            node.SetNodeReferenceID(PET_ONLY_SOURCE_ROLE, petNode.GetID())
+            if node.GetDisplayNode() is None:
+                displayNode = slicer.vtkMRMLScalarVolumeDisplayNode()
+                displayNode.SetSaveWithScene(False)
+                slicer.mrmlScene.AddNode(displayNode)
+                node.SetAndObserveDisplayNodeID(displayNode.GetID())
+            self._configurePetOnlyDisplay(node.GetDisplayNode(), petNode)
 
-        if node.GetDisplayNode() is None:
-            node.CreateDefaultDisplayNodes()
-            node.GetDisplayNode().SetSaveWithScene(False)
-        displayNode = node.GetDisplayNode()
+        petDisplayNode = petNode.GetDisplayNode()
+        if petDisplayNode is not None:
+            bindWindowLevelSync(petDisplayNode, node.GetDisplayNode())
+        return node
+
+    @staticmethod
+    def _configurePetOnlyDisplay(displayNode, petNode):
         petDisplayNode = petNode.GetDisplayNode()
         wasModifying = displayNode.StartModify()
         displayNode.SetAndObserveColorNodeID(slicer.util.getNode("InvertedGrey").GetID())
@@ -1622,9 +1905,47 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             displayNode.SetLevel(petDisplayNode.GetLevel())
             displayNode.SetInterpolate(petDisplayNode.GetInterpolate())
         displayNode.EndModify(wasModifying)
-        if petDisplayNode is not None:
-            bindWindowLevelSync(petDisplayNode, displayNode)
-        return node
+
+    @staticmethod
+    def pointPetOnlyViewsAtSourcePet():
+        """Called when saving starts. Returns what was changed so it can be undone when saving ends."""
+        twin = Easy_fusionLogic.findPetOnlyVolume()
+        if twin is None:
+            return []
+        twinID = twin.GetID()
+        sourceID = twin.GetNodeReferenceID(PET_ONLY_SOURCE_ROLE)
+        if sourceID is not None and slicer.mrmlScene.GetNodeByID(sourceID) is None:
+            sourceID = None
+        swaps = []
+        for compositeNode in slicer.util.getNodesByClass("vtkMRMLSliceCompositeNode"):
+            if compositeNode.GetBackgroundVolumeID() == twinID:
+                compositeNode.SetBackgroundVolumeID(sourceID)
+                swaps.append((compositeNode, twinID, sourceID))
+        return swaps
+
+    @staticmethod
+    def restorePetOnlyViews(swaps):
+        for compositeNode, twinID, sourceID in swaps:
+            if slicer.mrmlScene.GetNodeByID(twinID) is None:
+                continue
+            if compositeNode.GetBackgroundVolumeID() == sourceID:
+                compositeNode.SetBackgroundVolumeID(twinID)
+
+    @staticmethod
+    def clearDanglingViewReferences():
+        """Remove slice view volume references to nodes that do not exist (e.g. the unsaved twin in older scenes)."""
+        scene = slicer.mrmlScene
+        roles = (("GetBackgroundVolumeID", "SetBackgroundVolumeID"),
+                 ("GetForegroundVolumeID", "SetForegroundVolumeID"),
+                 ("GetLabelVolumeID", "SetLabelVolumeID"))
+        cleared = 0
+        for compositeNode in slicer.util.getNodesByClass("vtkMRMLSliceCompositeNode"):
+            for getterName, setterName in roles:
+                nodeID = getattr(compositeNode, getterName)()
+                if nodeID and scene.GetNodeByID(nodeID) is None:
+                    getattr(compositeNode, setterName)(None)
+                    cleared += 1
+        return cleared
 
     def applyViewRoles(self, petNode, ctNode, forceOrientation=False):
         """
@@ -1764,9 +2085,12 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         candidateIDs = {node.GetID() for node in candidates}
         for displayNode in slicer.util.getNodesByClass("vtkMRMLDisplayNode"):
             if displayNode.GetColorNodeID() in candidateIDs:
-                # Re-assign (not just "same ID") so the display re-fetches the lookup table object
+                # Re-assign (not just "same ID") so the display re-fetches the lookup table object.
+                # Go through a valid table: a display node must never be left without a color node.
                 wasModifying = displayNode.StartModify()
-                displayNode.SetAndObserveColorNodeID(None)
+                greyNode = slicer.mrmlScene.GetNodeByID("vtkMRMLColorTableNodeGrey")
+                if greyNode is not None and displayNode.GetColorNodeID() == canonical.GetID():
+                    displayNode.SetAndObserveColorNodeID(greyNode.GetID())
                 displayNode.SetAndObserveColorNodeID(canonical.GetID())
                 displayNode.EndModify(wasModifying)
 
@@ -1798,15 +2122,13 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         displayNode.SetColor(0.1, 0.9, 0.3)
         if hasattr(displayNode, "SetPropertiesLabelVisibility"):
             displayNode.SetPropertiesLabelVisibility(False)
-        if hasattr(displayNode, "SetPointLabelsVisibility"):
-            displayNode.SetPointLabelsVisibility(True)
         crossDot = getattr(slicer.vtkMRMLMarkupsDisplayNode, "CrossDot2D", None)
         if crossDot is not None:
             displayNode.SetGlyphType(crossDot)
-        textProperty = displayNode.GetTextProperty() if hasattr(displayNode, "GetTextProperty") else None
-        if textProperty is not None:
-            textProperty.SetBackgroundColor(0.0, 0.0, 0.0)
-            textProperty.SetBackgroundOpacity(0.5)
+        # Markups draw a point's label in the point's own color and right next to it, so the white,
+        # padded SUV text lives in a separate label layer (see updateRoiLabels)
+        if hasattr(displayNode, "SetPointLabelsVisibility"):
+            displayNode.SetPointLabelsVisibility(False)
 
     @staticmethod
     def isControlPointDefined(node, index):
@@ -1856,20 +2178,22 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         node.SetAttribute(ROI_NEXT_NUMBER_ATTRIBUTE, "1")
 
     @staticmethod
-    def statsCacheKey(volumeNode, center, radius):
+    def statsCacheKey(volumeNode, center, radius, thresholdMode=THRESHOLD_RELATIVE, thresholdValue=DEFAULT_RELATIVE_THRESHOLD):
         roundedCenter = tuple(round(c, 3) for c in center)
+        thresholdKey = (thresholdMode, round(float(thresholdValue), 4))
         if volumeNode is None:
-            return (None, roundedCenter, round(radius, 3))
+            return (None, roundedCenter, round(radius, 3), thresholdKey)
         imageData = volumeNode.GetImageData()
         transformNode = volumeNode.GetParentTransformNode()
         return (volumeNode.GetID(), volumeNode.GetMTime(),
                 imageData.GetMTime() if imageData else 0,
                 transformNode.GetMTime() if transformNode else 0,
-                roundedCenter, round(radius, 3))
+                roundedCenter, round(radius, 3), thresholdKey)
 
     @staticmethod
-    def computeSphereStatistics(volumeNode, centerWorld, radiusMm):
-        """SUV statistics of the PET voxels inside a sphere given in world coordinates."""
+    def computeSphereStatistics(volumeNode, centerWorld, radiusMm,
+                                thresholdMode=THRESHOLD_RELATIVE, thresholdValue=DEFAULT_RELATIVE_THRESHOLD):
+        """SUV statistics (sphere + thresholded segment) of the PET voxels inside a sphere given in world coordinates."""
         if volumeNode is None or volumeNode.GetImageData() is None:
             return None
         center = list(centerWorld)
@@ -1883,7 +2207,7 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         return sphereStatisticsFromArray(
             slicer.util.arrayFromVolume(volumeNode),
             slicer.util.arrayFromVTKMatrix(ijkToRas),
-            center, radiusMm)
+            center, radiusMm, thresholdMode, thresholdValue)
 
     @staticmethod
     def findRoiModelNode():
@@ -1904,28 +2228,33 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
                 return node
         return None
 
-    @staticmethod
-    def createRoiHandlesNode():
+    def createRoiHandlesNode(self):
         node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "SUV ROI radius handles")
         node.SetAttribute(ROI_HANDLES_ATTRIBUTE, "1")
         if hasattr(node, "SetControlPointLabelFormat"):
             node.SetControlPointLabelFormat("")
         node.CreateDefaultDisplayNodes()
-        displayNode = node.GetDisplayNode()
-        if displayNode is not None:
+        self.styleRoiHandlesDisplayNode(node.GetDisplayNode())
+        return node
+
+    @staticmethod
+    def styleRoiHandlesDisplayNode(displayNode):
+        if displayNode is None:
+            return
+        if displayNode.GetGlyphScale() != ROI_HANDLE_GLYPH_SCALE:
+            displayNode.SetGlyphScale(ROI_HANDLE_GLYPH_SCALE)
+        if tuple(displayNode.GetSelectedColor()) != (1.0, 0.85, 0.0):
             displayNode.SetSelectedColor(1.0, 0.85, 0.0)
             displayNode.SetColor(1.0, 0.85, 0.0)
-            displayNode.SetGlyphScale(2.0)
-            square = getattr(slicer.vtkMRMLMarkupsDisplayNode, "Square2D", None)
-            if square is not None:
-                displayNode.SetGlyphType(square)
-            if hasattr(displayNode, "SetPointLabelsVisibility"):
-                displayNode.SetPointLabelsVisibility(False)
-            if hasattr(displayNode, "SetPropertiesLabelVisibility"):
-                displayNode.SetPropertiesLabelVisibility(False)
-            if hasattr(displayNode, "SetVisibility3D"):
-                displayNode.SetVisibility3D(False)  # handles are for slice views; keep the MIP clean
-        return node
+        square = getattr(slicer.vtkMRMLMarkupsDisplayNode, "Square2D", None)
+        if square is not None and displayNode.GetGlyphType() != square:
+            displayNode.SetGlyphType(square)
+        if hasattr(displayNode, "SetPointLabelsVisibility") and displayNode.GetPointLabelsVisibility():
+            displayNode.SetPointLabelsVisibility(False)
+        if hasattr(displayNode, "SetPropertiesLabelVisibility") and displayNode.GetPropertiesLabelVisibility():
+            displayNode.SetPropertiesLabelVisibility(False)
+        if hasattr(displayNode, "SetVisibility3D") and displayNode.GetVisibility3D():
+            displayNode.SetVisibility3D(False)  # handles are for slice views; keep the MIP clean
 
     def removeRoiHandlesNode(self):
         handlesNode = self.findRoiHandlesNode()
@@ -1947,10 +2276,12 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             displayNode.SetColor(0.1, 0.9, 0.3)
             if hasattr(displayNode, "SetVisibility2D"):
                 displayNode.SetVisibility2D(True)
-                displayNode.SetVisibility3D(False)  # keep the MIP uncluttered; labels still show in 3D
+                displayNode.SetVisibility3D(False)  # keep the MIP uncluttered
             else:
                 displayNode.SetSliceIntersectionVisibility(True)
-            displayNode.SetSliceIntersectionThickness(2)
+        displayNode = modelNode.GetDisplayNode()
+        if displayNode is not None and displayNode.GetSliceIntersectionThickness() != ROI_SPHERE_OUTLINE_PX:
+            displayNode.SetSliceIntersectionThickness(ROI_SPHERE_OUTLINE_PX)
 
         append = vtk.vtkAppendPolyData()
         for center, radius in spheres:
@@ -1965,3 +2296,192 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         polyData = vtk.vtkPolyData()
         polyData.DeepCopy(append.GetOutput())
         modelNode.SetAndObservePolyData(polyData)
+
+    # --- ROI labels (white SUV text, one radius away from the center) -------
+
+    @staticmethod
+    def findRoiLabelsNode():
+        for node in slicer.util.getNodesByClass("vtkMRMLMarkupsFiducialNode"):
+            if node.GetAttribute(ROI_LABELS_ATTRIBUTE):
+                return node
+        return None
+
+    def createRoiLabelsNode(self):
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "SUV ROI labels")
+        node.SetAttribute(ROI_LABELS_ATTRIBUTE, "1")
+        node.SetLocked(True)  # text only: never picked or dragged
+        if hasattr(node, "SetControlPointLabelFormat"):
+            node.SetControlPointLabelFormat("")
+        node.CreateDefaultDisplayNodes()
+        self.styleRoiLabelsDisplayNode(node.GetDisplayNode())
+        return node
+
+    @staticmethod
+    def styleRoiLabelsDisplayNode(displayNode):
+        if displayNode is None:
+            return
+        wasModifying = displayNode.StartModify()
+        # Markups use the glyph color for the text, so the whole layer is white
+        displayNode.SetColor(1.0, 1.0, 1.0)
+        displayNode.SetSelectedColor(1.0, 1.0, 1.0)
+        displayNode.SetTextScale(ROI_LABEL_TEXT_SCALE)
+        # Practically invisible anchor glyph; also keeps the text right at the anchor
+        dash = getattr(slicer.vtkMRMLMarkupsDisplayNode, "Dash2D", None)
+        if dash is not None:
+            displayNode.SetGlyphType(dash)
+        displayNode.SetGlyphScale(0.2)
+        if hasattr(displayNode, "SetPointLabelsVisibility"):
+            displayNode.SetPointLabelsVisibility(True)
+        if hasattr(displayNode, "SetPropertiesLabelVisibility"):
+            displayNode.SetPropertiesLabelVisibility(False)
+        if hasattr(displayNode, "SetVisibility3D"):
+            displayNode.SetVisibility3D(False)  # the MIP background is white
+        textProperty = displayNode.GetTextProperty() if hasattr(displayNode, "GetTextProperty") else None
+        if textProperty is not None:  # flat: no box, no shadow, no frame
+            textProperty.SetBackgroundOpacity(0.0)
+            textProperty.SetShadow(False)
+            textProperty.SetFrame(False)
+        displayNode.EndModify(wasModifying)
+
+    def updateRoiLabels(self, entries):
+        """entries: list of (roiPointID, centerWorld, radius, text). Keeps 3 anchors per ROI in sync."""
+        labelsNode = self.findRoiLabelsNode()
+        if not entries:
+            if labelsNode is not None and labelsNode.GetNumberOfControlPoints() > 0:
+                labelsNode.RemoveAllControlPoints()
+            return
+        if labelsNode is None:
+            labelsNode = self.createRoiLabelsNode()
+        elif not labelsNode.GetAttribute("EasyFusion.StyleVersion") == "1":
+            self.styleRoiLabelsDisplayNode(labelsNode.GetDisplayNode())
+        labelsNode.SetAttribute("EasyFusion.StyleVersion", "1")
+
+        planeCount = len(LABEL_ANCHOR_DIRECTIONS)
+        wanted = {}
+        for roiID, center, radius, text in entries:
+            for plane in range(planeCount):
+                wanted[(roiID, plane)] = (labelAnchorPosition(center, radius, plane), text)
+
+        seen = set()
+        for i in reversed(range(labelsNode.GetNumberOfControlPoints())):
+            key = parseHandleDescription(labelsNode.GetNthControlPointDescription(i), planeCount)
+            if key is None or key not in wanted or key in seen:
+                labelsNode.RemoveNthControlPoint(i)
+            else:
+                seen.add(key)
+
+        indexByKey = {}
+        for i in range(labelsNode.GetNumberOfControlPoints()):
+            key = parseHandleDescription(labelsNode.GetNthControlPointDescription(i), planeCount)
+            if key is not None:
+                indexByKey[key] = i
+
+        for key, (position, text) in wanted.items():
+            index = indexByKey.get(key)
+            if index is None:
+                index = labelsNode.AddControlPoint(position)
+                labelsNode.SetNthControlPointDescription(index, f"{key[0]}:{key[1]}")
+            else:
+                current = [0.0, 0.0, 0.0]
+                labelsNode.GetNthControlPointPositionWorld(index, current)
+                if _distance(current, position) > 1e-3:
+                    labelsNode.SetNthControlPointPositionWorld(index, position[0], position[1], position[2])
+            if labelsNode.GetNthControlPointLabel(index) != text:
+                labelsNode.SetNthControlPointLabel(index, text)
+
+    def removeRoiLabelsNode(self):
+        labelsNode = self.findRoiLabelsNode()
+        if labelsNode is not None:
+            slicer.mrmlScene.RemoveNode(labelsNode)
+
+    # --- ROI segments (threshold inside each sphere: MTV / TLG) -------------
+
+    @staticmethod
+    def findRoiSegmentationNode():
+        for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode"):
+            if node.GetAttribute(ROI_SEGMENTATION_ATTRIBUTE):
+                return node
+        return None
+
+    @staticmethod
+    def styleRoiSegmentationDisplayNode(displayNode):
+        if displayNode is None:
+            return
+        wasModifying = displayNode.StartModify()
+        displayNode.SetVisibility2DFill(False)   # outline only
+        displayNode.SetOpacity2DFill(0.0)
+        displayNode.SetVisibility2DOutline(True)
+        displayNode.SetOpacity2DOutline(1.0)
+        displayNode.SetSliceIntersectionThickness(ROI_SEGMENT_OUTLINE_PX)
+        displayNode.SetVisibility3D(False)
+        displayNode.EndModify(wasModifying)
+
+    def getOrCreateRoiSegmentationNode(self, petNode):
+        segmentationNode = self.findRoiSegmentationNode()
+        if segmentationNode is None:
+            segmentationNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", "SUV ROI segments")
+            segmentationNode.SetAttribute(ROI_SEGMENTATION_ATTRIBUTE, "1")
+            segmentationNode.CreateDefaultDisplayNodes()
+        self.styleRoiSegmentationDisplayNode(segmentationNode.GetDisplayNode())
+        # Segment masks are computed on the PET voxel grid, so the segmentation uses the PET geometry
+        if segmentationNode.GetNodeReferenceID(ROI_SEGMENTATION_PET_ROLE) != petNode.GetID():
+            segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(petNode)
+            segmentationNode.SetNodeReferenceID(ROI_SEGMENTATION_PET_ROLE, petNode.GetID())
+        if segmentationNode.GetTransformNodeID() != petNode.GetTransformNodeID():
+            segmentationNode.SetAndObserveTransformNodeID(petNode.GetTransformNodeID())
+        return segmentationNode
+
+    @staticmethod
+    def writeSegmentMask(segmentationNode, segmentID, petNode, extent, mask):
+        """Replace a segment with a boolean mask given on the PET voxel grid ([k, j, i] over extent)."""
+        from vtk.util import numpy_support
+        labelmap = slicer.vtkOrientedImageData()
+        ijkToRas = vtk.vtkMatrix4x4()
+        petNode.GetIJKToRASMatrix(ijkToRas)
+        labelmap.SetImageToWorldMatrix(ijkToRas)
+        labelmap.SetExtent(*extent)
+        labelmap.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
+        scalars = labelmap.GetPointData().GetScalars()
+        numpy_support.vtk_to_numpy(scalars)[:] = np.asarray(mask, dtype=np.uint8).ravel()
+        scalars.Modified()
+        mode = getattr(slicer.vtkSlicerSegmentationsModuleLogic, "MODE_REPLACE", 0)
+        slicer.vtkSlicerSegmentationsModuleLogic.SetBinaryLabelmapToSegment(labelmap, segmentationNode, segmentID, mode)
+
+    def updateRoiSegments(self, entries, petNode):
+        """entries: list of (roiPointID, name, stats, unchanged). One segment per ROI, removed with the ROI."""
+        segmentationNode = self.findRoiSegmentationNode()
+        if petNode is None or petNode.GetImageData() is None:
+            return
+        if not entries and segmentationNode is None:
+            return
+        segmentationNode = self.getOrCreateRoiSegmentationNode(petNode)
+        segmentation = segmentationNode.GetSegmentation()
+
+        wantedIDs = set()
+        for roiID, name, stats, unchanged in entries:
+            segmentID = ROI_SEGMENT_ID_PREFIX + roiID
+            wantedIDs.add(segmentID)
+            segment = segmentation.GetSegment(segmentID)
+            if segment is None:
+                segmentation.AddEmptySegment(segmentID, name, list(ROI_SEGMENT_COLOR))
+                unchanged = False
+            elif segment.GetName() != name:
+                segment.SetName(name)
+            if unchanged:
+                continue  # same ROI, PET and threshold as last time: segment is already up to date
+            if stats is None:
+                self.writeSegmentMask(segmentationNode, segmentID, petNode, (0, 0, 0, 0, 0, 0), np.zeros((1, 1, 1), bool))
+            else:
+                self.writeSegmentMask(segmentationNode, segmentID, petNode, stats["extent"], stats["segMask"])
+
+        existingIDs = vtk.vtkStringArray()
+        segmentation.GetSegmentIDs(existingIDs)
+        for i in range(existingIDs.GetNumberOfValues()):
+            segmentID = existingIDs.GetValue(i)
+            if segmentID.startswith(ROI_SEGMENT_ID_PREFIX) and segmentID not in wantedIDs:
+                segmentation.RemoveSegment(segmentID)
+
+    def removeRoiSegmentationNode(self):
+        segmentationNode = self.findRoiSegmentationNode()
+        if segmentationNode is not None:
+            slicer.mrmlScene.RemoveNode(segmentationNode)
