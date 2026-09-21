@@ -1303,7 +1303,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.setupMeasurementSection()
         self.setupFilterSection()
 
-        self.layout.addStretch(1)
+
 
         bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Icons", "fusbanner.jpg")
         if os.path.exists(bannerPath):
@@ -1586,6 +1586,10 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         measurementCollapsibleButton.text = "SUV Measurements (spherical ROI)"
         self.layout.addWidget(measurementCollapsibleButton)
         measurementLayout = qt.QFormLayout(measurementCollapsibleButton)
+
+        self.roitipLabel = qt.QLabel("Press 'Insert' key to place ROIs")
+        self.roitipLabel.setStyleSheet("color: red; font-weight: bold;")
+        measurementLayout.addRow(self.roitipLabel)
 
         self.roiRadiusSpinBox = qt.QDoubleSpinBox()
         self.roiRadiusSpinBox.setRange(1.0, 100.0)
