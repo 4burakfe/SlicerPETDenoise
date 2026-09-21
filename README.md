@@ -10,7 +10,7 @@
 ![Screenshot](PETDenoise/Resources/banner.png)
 ![Screenshot](Easy_fusion/Resources/Icons/fusbanner.jpg)
 
-SlicerPETDenoise is a 3D Slicer extension with three modules for medical image research, particularly SPECT/PET and CT/MRI workflows. They assist in denoising, comparing, and reviewing / fusing volumetric data. The tools are developed with research utility in mind and are **not intended for clinical use**.
+SlicerPETDenoise is a 3D Slicer extension with three modules for medical image research, particularly SPECT/PET and CT/MRI workflows. They assist in denoising, comparing, and reviewing / fusing, segmenting volumetric data. The tools are developed with research utility in mind and are **not intended for clinical use**.
 
 In Slicer the modules appear under the **Nuclear Medicine** category as:
 
