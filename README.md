@@ -28,7 +28,9 @@ This extension is available in the 3D Slicer **Extensions Manager** (see [Instal
 
 You can train your own models with the scripts provided here: https://github.com/4burakfe/Claritas 
 
-Pretrained models ready for use: https://github.com/4burakfe/SlicerPETDenoise/releases/tag/Models
+Pretrained denoising models ready for use: https://github.com/4burakfe/SlicerPETDenoise/releases/tag/Models
+
+Pretrained super-resolution models ready for use: [https://github.com/4burakfe/SlicerPETDenoise/releases/tag/Models](https://github.com/4burakfe/SlicerPETDenoise/releases/tag/SuperRes_Models)
 
 You can test the modules with the cases here: https://github.com/4burakfe/SlicerPETDenoise_SampleCases/releases/tag/images
 
