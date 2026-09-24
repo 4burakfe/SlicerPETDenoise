@@ -182,6 +182,9 @@ CUSTOM_LAYOUT_IDS = (LAYOUT_AXIAL_FOUR_UP_ID, LAYOUT_TWO_BY_THREE_ID, LAYOUT_CT_
 DUAL_MONITOR_WINDOW_TITLE = "EasyFusion - Monitor 2"
 # Delay before the Monitor 2 window is moved / maximized (after the layout manager has created its views)
 DUAL_MONITOR_PLACE_DELAY_MS = 300
+# A dual monitor layout found in a saved scene (or restored at startup) on a computer with a single screen is
+# replaced by this layout. The floating Monitor 2 window is never created in that case (it crashed Slicer).
+SINGLE_SCREEN_FALLBACK_LAYOUT_ID = LAYOUT_TWO_BY_THREE_ID
 # The 3D view that shows the MIP: the only 3D view of every EasyFusion layout (and of Slicer's four-up)
 MIP_VIEW_TAG = "1"
 MIP_RAYCAST_TECHNIQUE = 2   # vtkMRMLViewNode::MaximumIntensityProjection
@@ -339,8 +342,21 @@ def _dualMonitorLayout(axialRow, sagittalRow):
         '</viewports>')
 
 
-def buildLayoutDescriptions():
-    """Layout XML for the custom EasyFusion layouts, keyed by layout ID."""
+def hasMultipleScreens():
+    """True when Qt reports at least two screens (a second monitor is connected)."""
+    try:
+        return len(list(qt.QGuiApplication.screens())) >= 2
+    except Exception:
+        logging.debug("EasyFusion: could not count screens, assuming a single screen")
+        return False
+
+
+def buildLayoutDescriptions(singleScreenSafe=False):
+    """
+    Layout XML for the custom EasyFusion layouts, keyed by layout ID.
+    singleScreenSafe: the dual monitor IDs get the fallback (single window) layout instead of their
+    two-viewport description, so a scene saved in a dual monitor layout builds no floating window while loading.
+    """
     axialFourUp = (
         '<layout type="vertical">'
         + _nested("horizontal", [_sliceViewItem("Red"), _THREED_VIEW_ITEM])
@@ -364,7 +380,7 @@ def buildLayoutDescriptions():
         + _THREED_VIEW_ITEM
         + '</layout>')
 
-    return {
+    descriptions = {
         LAYOUT_AXIAL_FOUR_UP_ID: axialFourUp,
         LAYOUT_TWO_BY_THREE_ID: twoByThree,
         LAYOUT_DUAL_MONITOR_ID: _dualMonitorLayout(
@@ -373,6 +389,10 @@ def buildLayoutDescriptions():
         LAYOUT_DUAL_MONITOR_FUSION_MIDDLE_ID: _dualMonitorLayout(
             ("EFAxialCT", "Red", "EFAxialPET"), ("EFSagittalCT", "Yellow", "EFSagittalPET")),
     }
+    if singleScreenSafe:
+        for layoutID in DUAL_MONITOR_LAYOUT_IDS:
+            descriptions[layoutID] = descriptions[SINGLE_SCREEN_FALLBACK_LAYOUT_ID]
+    return descriptions
 
 
 def fieldOfViewForTarget(sourceFieldOfView, targetDimensions):
@@ -455,8 +475,10 @@ def registerSceneObservers():
             continue
         _sceneObserverTags.append(scene.AddObserver(event, handler))
     try:
-        Easy_fusionLogic.ensureLayoutsRegistered()
+        # Single screen: a restored dual monitor layout must not build the Monitor 2 window, even for a moment
+        Easy_fusionLogic.ensureLayoutsRegistered(singleScreenSafe=not hasMultipleScreens())
         Easy_fusionLogic.reapplyRestoredCustomLayout()
+        Easy_fusionLogic.ensureLayoutsRegistered()  # real dual monitor layouts for the buttons
         Easy_fusionLogic.placeSecondaryViewportWindowAfterLoad()  # Slicer restored a dual monitor layout
     except Exception:
         logging.exception("EasyFusion: could not register layouts")
@@ -505,9 +527,12 @@ def _onSceneStartClose(caller, event):
 
 
 def _onSceneStartImport(caller, event):
-    # A saved scene stores only the layout ID: the EasyFusion descriptions must exist before the layout node is read
+    # A saved scene stores only the layout ID: the EasyFusion descriptions must exist before the layout node is read.
+    # With a single screen, the dual monitor IDs temporarily point at the fallback layout, so a scene saved on a
+    # dual monitor workstation never builds the floating Monitor 2 window here (that crashed Slicer). After the load,
+    # switchDualMonitorLayoutIfSingleScreen() moves to the real fallback ID and restores the dual monitor layouts.
     try:
-        Easy_fusionLogic.ensureLayoutsRegistered()
+        Easy_fusionLogic.ensureLayoutsRegistered(singleScreenSafe=not hasMultipleScreens())
     except Exception:
         logging.exception("EasyFusion: could not register layouts before loading a scene")
 
@@ -576,6 +601,7 @@ def _afterSceneLoad():
     steps = [logic.clearDanglingViewReferences,
              logic.stopAllViewRotations,
              logic.repairHotIronColorNodes,
+             logic.switchDualMonitorLayoutIfSingleScreen,
              logic.restoreViewRolesAfterLoad,
              logic.placeSecondaryViewportWindowAfterLoad]
     steps += list(_postLoadListeners)
@@ -3881,12 +3907,12 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
     # --- Layouts and view contents ------------------------------------------
 
     @staticmethod
-    def ensureLayoutsRegistered():
+    def ensureLayoutsRegistered(singleScreenSafe=False):
         layoutManager = slicer.app.layoutManager()
         if layoutManager is None:
             return
         layoutNode = layoutManager.layoutLogic().GetLayoutNode()
-        for layoutID, description in buildLayoutDescriptions().items():
+        for layoutID, description in buildLayoutDescriptions(singleScreenSafe).items():
             if not layoutNode.IsLayoutDescription(layoutID):
                 layoutNode.AddLayoutDescription(layoutID, description)
             elif (layoutNode.GetLayoutDescription(layoutID) != description
@@ -3906,8 +3932,32 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             return
         layoutNode = layoutManager.layoutLogic().GetLayoutNode()
         arrangement = layoutNode.GetViewArrangement()
-        if arrangement in CUSTOM_LAYOUT_IDS:
+        if arrangement in DUAL_MONITOR_LAYOUT_IDS and not hasMultipleScreens():
+            # Last session ended in a dual monitor layout, but only one screen now: never build the Monitor 2 window
+            logging.info("EasyFusion: single screen, restoring the 2x3 + 3D layout instead of the dual monitor layout")
+            layoutNode.SetViewArrangement(SINGLE_SCREEN_FALLBACK_LAYOUT_ID)
+        elif arrangement in CUSTOM_LAYOUT_IDS:
             layoutNode.SetViewArrangement(arrangement)
+
+    @staticmethod
+    def switchDualMonitorLayoutIfSingleScreen():
+        """
+        Post-load step. A scene saved in a dual monitor layout was loaded with its dual monitor ID but the
+        fallback description (see _onSceneStartImport) when only one screen is connected. Switch to the fallback
+        layout's own ID (so its button is highlighted and the scene is saved with it), then put the real dual
+        monitor descriptions back so the Dual Monitor buttons work again once a second screen is connected.
+        """
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return
+        if layoutManager.layout in DUAL_MONITOR_LAYOUT_IDS and not hasMultipleScreens():
+            logging.info("EasyFusion: scene was saved in a dual monitor layout; only one screen is connected, "
+                         "switching to the 2x3 + 3D layout")
+            layoutManager.setLayout(SINGLE_SCREEN_FALLBACK_LAYOUT_ID)
+            slicer.util.showStatusMessage(
+                "EasyFusion: scene saved for two monitors, shown in the 2×3 + 3D layout (single screen).", 6000)
+        # Never replaces the description of the layout on screen (guarded in ensureLayoutsRegistered)
+        Easy_fusionLogic.ensureLayoutsRegistered()
 
     @staticmethod
     def viewUnderCursor():
