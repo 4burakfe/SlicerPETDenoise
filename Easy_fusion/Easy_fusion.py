@@ -1,8 +1,17 @@
 import os
 import re
+import ast
+import gc
+import html
+import math
+import time
 import random
 import colorsys
 import logging
+import importlib
+import traceback
+import configparser
+import contextlib
 
 import numpy as np
 import qt
@@ -17,6 +26,7 @@ from slicer.util import VTKObservationMixin
 ANIMATION_OFF = 0
 ANIMATION_SPIN = 1
 
+MODULE_NAME = "Easy_fusion"
 HOT_IRON_NAME = "CustomHotIron"
 _HOT_IRON_NAME_PATTERN = re.compile(r"^CustomHotIron([_ ]\d+)?$")
 
@@ -43,6 +53,39 @@ DEFAULT_ABSOLUTE_THRESHOLD = 2.5
 SETTINGS_THRESHOLD_MODE = "EasyFusion.ThresholdMode"
 SETTINGS_RELATIVE_THRESHOLD = "EasyFusion.RelativeThreshold"
 SETTINGS_ABSOLUTE_THRESHOLD = "EasyFusion.AbsoluteThreshold"
+# Each ROI keeps its own threshold; the panel's threshold is the default given to new ROIs
+ROI_THRESHOLD_ATTRIBUTE = "EasyFusion.RoiThreshold_"  # + control point ID, e.g. "relative 40" / "absolute 2.5"
+# Who created an ROI (for future AI lesion detection): stored per ROI, saved with the scene
+ROI_ORIGIN_ATTRIBUTE = "EasyFusion.RoiOrigin_"        # + control point ID
+ROI_ORIGIN_USER = "user"
+ROI_ORIGIN_AI = "ai"
+# Values that can be shown next to each ROI in the slice views and on the MIP (key, checkbox text).
+# A display preference of the user, so it is kept in the application settings, not in the scene.
+ROI_LABEL_FIELDS = (("name", "Name"), ("max", "Max"), ("mean", "Mean"), ("mtv", "MTV"), ("tlg", "TLG"),
+                    ("radius", "Radius"), ("threshold", "Threshold"))
+DEFAULT_ROI_LABEL_FIELDS = ("name", "max", "mean")
+SETTINGS_ROI_LABEL_FIELDS = "EasyFusion/RoiLabelFields"
+# Folder of the last ROI table export (application setting, like the label fields)
+SETTINGS_ROI_EXPORT_FOLDER = "EasyFusion/RoiExportFolder"
+
+# Slice view text. Slicer's own corner annotations (Data Probe) and EasyFusion's window info in the bottom-right corner
+DATA_PROBE_ANNOTATIONS_SETTING = "DataProbe/sliceViewAnnotations.enabled"   # Slicer's setting, 1 / 0
+# Slicer's per-corner switches ("active corners"): (attribute of the annotations object, its check box, setting)
+DATA_PROBE_CORNERS = (
+    ("topLeft", "topLeftCheckBox", "DataProbe/sliceViewAnnotations.topLeft"),
+    ("topRight", "topRightCheckBox", "DataProbe/sliceViewAnnotations.topRight"),
+    ("bottomLeft", "bottomLeftCheckBox", "DataProbe/sliceViewAnnotations.bottomLeft"),
+)
+DATA_PROBE_CORNER_INDEXES = (2, 3, 0)   # the same corners in the view's vtkCornerAnnotation
+# Which corners were on when EasyFusion hid the annotations, e.g. "1,1,0" (restored by showing them again)
+SETTINGS_SLICER_ANNOTATION_CORNERS = "EasyFusion/SlicerAnnotationCorners"
+DATA_PROBE_FONT_SIZE_SETTING = "DataProbe/sliceViewAnnotations.fontSize"
+SETTINGS_SHOW_WINDOW_INFO = "EasyFusion/ShowWindowInfo"
+WINDOW_INFO_CORNER = 1               # vtkCornerAnnotation: 0 lower left, 1 lower right, 2 upper left, 3 upper right
+WINDOW_INFO_DEFAULT_FONT_SIZE = 14   # same default as Slicer's slice view annotations
+WINDOW_INFO_UPDATE_MS = 40           # at most ~25 updates per second while window / level is being dragged
+WINDOW_INFO_LIGHT_TEXT = (1.0, 1.0, 1.0)    # on CT / fusion views (dark background)
+WINDOW_INFO_DARK_TEXT = (0.1, 0.1, 0.1)     # on PET-only views (inverted grey: white background)
 
 # ROI appearance
 ROI_SPHERE_OUTLINE_PX = 1
@@ -55,6 +98,10 @@ ROI_LABEL_TEXT_SCALE = 2.5
 # 3D segment surfaces follow the voxels exactly (no smoothing), so they match the measured MTV
 SEGMENT_SURFACE_SMOOTHING = "0.0"
 MIP_OVERLAY_SEGMENT_OPACITY = 0.65
+# MIP zoom fit: the 3D view always starts showing this much anatomy from top to bottom (mm)
+MIP_FIT_HEIGHT_MM = 1200.0
+# Fit again once the orthographic switch and the layout change have been applied (after alignSliceViews' 150 ms)
+MIP_FIT_DELAY_MS = 300
 MIP_OVERLAY_TEXT_COLOR = (0.05, 0.05, 0.05)
 MIP_OVERLAY_TEXT_BACKGROUND = (1.0, 1.0, 1.0)
 MIP_OVERLAY_TEXT_BACKGROUND_OPACITY = 0.75
@@ -95,6 +142,22 @@ PET_SUV_PRESETS = [
 WINDOW_SHORTCUT_KEYS = ["F5", "F6", "F7", "F8", "F9"]
 # SPECT (or any uncalibrated image): 0 .. percent of the maximum count in the volume
 SPECT_PERCENT_OF_MAX_PRESETS = [10, 25, 50, 75, 100]
+# MRI (arbitrary intensity units, e.g. PET/MRI): window between two percentiles of the tissue voxels
+# (button text, lower percentile, upper percentile, shortcut key over CT/MRI views when the volume is an MRI)
+MRI_PERCENTILE_PRESETS = [
+    ("Standard", 1.0, 99.0, "F5"),
+    ("Wide", 0.5, 99.5, "F6"),
+    ("Contrast", 5.0, 95.0, "F7"),
+    ("Bright", 0.0, 90.0, "F8"),
+]
+# Voxels below this fraction of the 99.5th percentile count as air / background, not tissue
+MRI_BACKGROUND_FRACTION = 0.05
+# At most this many voxels are sampled for the percentiles (fast on large volumes)
+MRI_PRESET_SAMPLE_SIZE = 2000000
+# A CT has air around -1000 HU; an MRI (almost) never goes this far below 0
+CT_MINIMUM_BELOW = -500.0
+# Wait for both selectors before updating the views (e.g. one change of each in a row)
+INPUT_UPDATE_DELAY_MS = 150
 
 # (button text, color node name); PET-DICOM and Hot Metal Blue on the second row
 PET_COLOR_MAP_BUTTONS = [
@@ -117,6 +180,11 @@ LAYOUT_DUAL_MONITOR_FUSION_MIDDLE_ID = 7505
 DUAL_MONITOR_LAYOUT_IDS = (LAYOUT_DUAL_MONITOR_ID, LAYOUT_DUAL_MONITOR_FUSION_MIDDLE_ID)
 CUSTOM_LAYOUT_IDS = (LAYOUT_AXIAL_FOUR_UP_ID, LAYOUT_TWO_BY_THREE_ID, LAYOUT_CT_FUSION_PET_3D_ID) + DUAL_MONITOR_LAYOUT_IDS
 DUAL_MONITOR_WINDOW_TITLE = "EasyFusion - Monitor 2"
+# Delay before the Monitor 2 window is moved / maximized (after the layout manager has created its views)
+DUAL_MONITOR_PLACE_DELAY_MS = 300
+# The 3D view that shows the MIP: the only 3D view of every EasyFusion layout (and of Slicer's four-up)
+MIP_VIEW_TAG = "1"
+MIP_RAYCAST_TECHNIQUE = 2   # vtkMRMLViewNode::MaximumIntensityProjection
 
 # Slice view name -> (orientation, content). Content: fusion = CT + PET overlay,
 # ct = CT only, pet = PET only (inverted grey). Red/Yellow/Green keep their usual fusion role.
@@ -144,12 +212,62 @@ _SLICE_VIEW_STYLE = {  # label, color (lighter shades for the extra views, like 
 SETTINGS_NODE_TAG = "EasyFusion"
 SETTINGS_PET_ROLE = "EasyFusionPET"
 SETTINGS_CT_ROLE = "EasyFusionCT"
+# "true" on the settings node: EasyFusion was the module shown when the scene was saved (reopened on load)
+SETTINGS_ACTIVE_MODULE = "WasActiveModule"
 PET_ONLY_VOLUME_ATTRIBUTE = "EasyFusion.PETOnlyDisplayVolume"
 PET_ONLY_SOURCE_ROLE = "EasyFusionSourcePET"
 # Fixed IDs for the unsaved twin. An auto-numbered ID (e.g. vtkMRMLScalarVolumeNode3) can be handed to a
 # completely different volume in the next scene; these can only ever belong to the twin.
 PET_ONLY_VOLUME_ID = "vtkMRMLScalarVolumeNodeEasyFusionPETOnly"
 PET_ONLY_DISPLAY_ID = "vtkMRMLScalarVolumeDisplayNodeEasyFusionPETOnly"
+
+# ---------------------------------------------------------------------------
+# AI post-processing filters (models of the Belenos PET Denoise module: <name>.pth + <name>.txt sidecar)
+# ---------------------------------------------------------------------------
+
+# A filter never changes its input: the result is always a new volume, tagged with where it came from
+FILTER_MODEL_ATTRIBUTE = "EasyFusion.FilterModel"
+FILTER_DATE_ATTRIBUTE = "EasyFusion.FilterDate"
+FILTER_SOURCE_ROLE = "EasyFusionFilterSource"
+FILTER_TARGET_PET = "pet"
+FILTER_TARGET_CT = "ct"
+SETTINGS_FILTER_MODEL_FOLDER = "EasyFusion/FilterModelFolder"  # application setting (qt.QSettings)
+# Inference settings of the PETDenoise module, so a model gives the same result in both modules
+FILTER_WINDOW_OVERLAP = 0.25
+FILTER_MIN_VRAM_GB = 1.9
+FILTER_EINOPS_REQUIREMENT = "einops==0.6.1"
+# Rough peak memory of one run, in float32 copies of the volume on the model's voxel grid
+FILTER_MEMORY_COPIES = 6
+# A run counts as large (the user is advised to crop) above this memory estimate or amount of network work
+# (number of windows x voxels per window; 5e8 is about 1900 windows of 64x64x64)
+FILTER_LARGE_MEMORY_BYTES = 4 * 1024 ** 3
+FILTER_LARGE_WORK_VOXELS = 5e8
+# Optional crop box ("Limit to ROI"): temporary, never saved, removed after a successful run
+FILTER_CROP_ROI_ATTRIBUTE = "EasyFusion.FilterCropROI"
+FILTER_CROP_ROI_NAME = "Filter crop ROI"
+FILTER_CROP_ROI_COLOR = (0.0, 0.85, 1.0)
+FILTER_CROPPED_ATTRIBUTE = "EasyFusion.FilterCroppedToROI"
+# Voxel-based crop of a volume under a non-linear (e.g. deformable registration) transform, which Crop Volume
+# refuses: the ROI surface is sampled on this many points per edge and mapped into the volume's own coordinates
+FILTER_CROP_SAMPLES_PER_EDGE = 9
+# Used for keys missing from a sidecar (or models without one): the defaults of the PETDenoise panel
+FILTER_DEFAULT_PARAMETERS = {
+    "dual_channel": False,
+    "architecture": "UNET",
+    "strides": (2, 2, 2, 2),
+    "channels": (128, 256, 512, 1024, 2048),
+    "res_units": 2,
+    "down_kernel": 3,
+    "up_kernel": 3,
+    "num_heads": (3, 6, 12, 24),
+    "depths": (2, 2, 2, 2),
+    "feature_size": 24,
+    "do_rate": 0.0,
+    "voxel_spacing": (2.0, 2.0, 2.0),
+    "block_size": (64, 64, 64),
+    "prevent_negative": True,
+    "dont_resample": False,
+}
 
 
 def _sliceViewItem(name):
@@ -175,15 +293,47 @@ def _sliceViews(*names):
     return [_sliceViewItem(name) for name in names]
 
 
+def _mainViewportAttributes():
+    """
+    XML attributes of the main-window viewport, copied from Slicer's own dual monitor layouts (same approach as
+    the Taranis dosimetry modules), so the first <layout> of <viewports> is always shown in the main window.
+    """
+    import xml.etree.ElementTree as ElementTree
+    try:
+        layoutNode = slicer.app.layoutManager().layoutLogic().GetLayoutNode()
+        for attributeName in dir(slicer.vtkMRMLLayoutNode):
+            if "DualMonitor" not in attributeName:
+                continue
+            layoutID = getattr(slicer.vtkMRMLLayoutNode, attributeName)
+            if not isinstance(layoutID, int) or not layoutNode.IsLayoutDescription(layoutID):
+                continue
+            root = ElementTree.fromstring(layoutNode.GetLayoutDescription(layoutID))
+            if root.tag != "viewports":
+                continue
+            for element in root.findall("layout"):
+                if (element.get("dockable") or "").lower() != "true":
+                    name = element.get("name")
+                    return f' name="{name}"' if name is not None else ""
+    except Exception as e:
+        logging.debug(f"EasyFusion: could not read Slicer's dual monitor layouts: {e}")
+    return ""  # no name: the main window viewport
+
+
 def _dualMonitorLayout(axialRow, sagittalRow):
-    """Main window: axial row over sagittal row. Second window (auto-placed on monitor 2): 3D + coronal."""
+    """
+    Main window: axial row over sagittal row. Second window (auto-placed on monitor 2): 3D + coronal.
+    The second window is a floating dock widget, exactly like Slicer's built-in dual monitor layouts. A
+    non-dockable viewport (a separate top-level window) crashed Slicer when a scene saved in this layout was
+    loaded while the main window was maximized.
+    """
     return (
         '<viewports>'
-        '<layout type="vertical">'
+        f'<layout type="vertical"{_mainViewportAttributes()}>'
         + _nested("horizontal", _sliceViews(*axialRow))
         + _nested("horizontal", _sliceViews(*sagittalRow))
         + '</layout>'
-        f'<layout name="EasyFusionMonitor2" type="horizontal" label="{DUAL_MONITOR_WINDOW_TITLE}" dockable="false">'
+        f'<layout name="EasyFusionMonitor2" type="horizontal" label="{DUAL_MONITOR_WINDOW_TITLE}" '
+        'dockable="true" dockPosition="floating">'
         + _THREED_VIEW_ITEM + _sliceViewItem("Green") + _sliceViewItem("EFCoronalCT")
         + '</layout>'
         '</viewports>')
@@ -236,11 +386,12 @@ def fieldOfViewForTarget(sourceFieldOfView, targetDimensions):
 class Easy_fusion(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
-        parent.title = "Lvgvs - SPECT/PET Review"
-        parent.categories = ["Nuclear Medicine"]
+        parent.title = "Epona - SPECT/PET Review"
+        parent.categories = ["Nuclear Medicine",""]
         parent.dependencies = []
         parent.contributors = ["Burak Demir, MD, FEBNM"]
-        parent.helpText = """
+        iconUrl = qt.QUrl.fromLocalFile(os.path.join(os.path.dirname(__file__), "Resources", "Icons", "Easy_fusion.png")).toString()        
+        parent.helpText = f"""
         This module provides easy fusion of SPECT/PET and CT/MR images.
         Spherical ROIs report Max and Mean, plus a thresholded segment inside each ROI
         (default 40% of Max, or an absolute SUV) giving segment Mean, MTV and TLG.
@@ -253,6 +404,13 @@ class Easy_fusion(ScriptedLoadableModule):
         F5-F9 = SUV 0-5, 0-7, 0-10, 0-15, 0-25 on fusion, PET and 3D views.
         Layout buttons switch between four-up, axial fusion/CT/PET, 2x3 + 3D, CT | fusion | PET + 3D and two
         dual monitor layouts (the dual monitor layouts need Slicer 5.2 or later).
+        Below them, "Slicer Annotations" shows or hides Slicer's own slice view annotations, and "Window Info"
+        shows the CT window / level and the SPECT/PET range in the bottom-right corner of each slice view.
+        Post-processing filters run the AI denoising / super-resolution models of the Belenos PET Denoise module
+        (a .pth file with its .txt parameter file) on the SPECT/PET or CT/MRI volume. The result is always a new
+        volume (the original is kept unchanged) and the views, MIP and SUV ROIs switch to it. SUVs measured on
+        a filtered volume differ from those of the original.
+        <p align="center"><img src="{iconUrl}" width="300"></p>
         """
         parent.acknowledgementText = """
         This file was developed by Burak Demir.
@@ -287,6 +445,7 @@ def registerSceneObservers():
         return
     scene = slicer.mrmlScene
     for eventName, handler in (("StartCloseEvent", _onSceneStartClose),
+                               ("StartImportEvent", _onSceneStartImport),
                                ("EndImportEvent", _onSceneEndImport),
                                ("StartSaveEvent", _onSceneStartSave),
                                ("EndSaveEvent", _onSceneEndSave)):
@@ -298,6 +457,7 @@ def registerSceneObservers():
     try:
         Easy_fusionLogic.ensureLayoutsRegistered()
         Easy_fusionLogic.reapplyRestoredCustomLayout()
+        Easy_fusionLogic.placeSecondaryViewportWindowAfterLoad()  # Slicer restored a dual monitor layout
     except Exception:
         logging.exception("EasyFusion: could not register layouts")
 
@@ -344,6 +504,14 @@ def _onSceneStartClose(caller, event):
     unbindWindowLevelSync()
 
 
+def _onSceneStartImport(caller, event):
+    # A saved scene stores only the layout ID: the EasyFusion descriptions must exist before the layout node is read
+    try:
+        Easy_fusionLogic.ensureLayoutsRegistered()
+    except Exception:
+        logging.exception("EasyFusion: could not register layouts before loading a scene")
+
+
 # While a scene file is written, PET-only views point at the real PET instead of the unsaved twin,
 # so saved scenes never reference a node ID that does not exist in the file.
 _saveSwaps = []
@@ -354,6 +522,10 @@ def _onSceneStartSave(caller, event):
         _saveSwaps[:] = Easy_fusionLogic.pointPetOnlyViewsAtSourcePet()
     except Exception:
         logging.exception("EasyFusion: could not prepare PET-only views for saving")
+    try:
+        Easy_fusionLogic.writeActiveModuleFlag()
+    except Exception:
+        logging.exception("EasyFusion: could not record whether the module is open")
 
 
 def _onSceneEndSave(caller, event):
@@ -404,8 +576,11 @@ def _afterSceneLoad():
     steps = [logic.clearDanglingViewReferences,
              logic.stopAllViewRotations,
              logic.repairHotIronColorNodes,
-             logic.restoreViewRolesAfterLoad]
+             logic.restoreViewRolesAfterLoad,
+             logic.placeSecondaryViewportWindowAfterLoad]
     steps += list(_postLoadListeners)
+    # Last: opening the module creates its panel if needed, which restores itself from the loaded scene
+    steps.append(logic.reopenModuleSavedAsActive)
     for step in steps:
         if sceneIsBusy():
             # Another load / close started in the meantime; its own EndImport schedules a new pass
@@ -493,6 +668,85 @@ def percentOfMaximum(maximum, percent):
     if not np.isfinite(maximum) or maximum <= 0 or percent <= 0:
         return None
     return maximum * percent / 100.0
+
+
+def tissueSample(values, backgroundFraction=MRI_BACKGROUND_FRACTION):
+    """
+    Voxel values that belong to the imaged body: padding (the minimum value) and air (below
+    backgroundFraction of the 99.5th percentile) are left out. Falls back to all finite values when
+    almost nothing would be left.
+    """
+    values = np.asarray(values, dtype=float).ravel()
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return values
+    minimum = values.min()
+    upper = np.percentile(values, 99.5)
+    cutoff = max(minimum, minimum + backgroundFraction * (upper - minimum))
+    tissue = values[values > cutoff]
+    return tissue if tissue.size >= max(10, values.size // 100) else values
+
+
+def percentileWindow(values, lowerPercentile, upperPercentile):
+    """(window, level) spanning two percentiles of values, or None when they are equal / there is no data."""
+    values = np.asarray(values, dtype=float).ravel()
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    lower, upper = np.percentile(values, [float(lowerPercentile), float(upperPercentile)])
+    if not upper > lower:
+        return None
+    return float(upper - lower), float((upper + lower) / 2.0)
+
+
+def looksLikeCT(scalarMinimum):
+    """True for a CT (air / padding far below 0 HU), False for an MRI or other positive-valued image."""
+    return scalarMinimum is not None and np.isfinite(scalarMinimum) and float(scalarMinimum) <= CT_MINIMUM_BELOW
+
+
+def formatWindowNumber(value):
+    """Compact number for the window info: 400, -600, 2.5, 0.35, 1.2e+04 -> 12000."""
+    value = float(value)
+    if not np.isfinite(value):
+        return "?"
+    if abs(value) < 1e-9:
+        return "0"
+    if abs(value) >= 100:
+        return f"{value:.0f}"
+    if abs(value) >= 10:
+        return f"{value:.1f}".rstrip("0").rstrip(".")
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def formatWindowInfoLine(kind, window, level, unit=""):
+    """
+    One line of the window info in the slice views.
+    kind "CT" / "MRI": window and level ("CT  W 400  L 50").
+    Anything else (PET, SPECT/PET, other volume names): the displayed range, which is how nuclear medicine
+    windows are usually read ("PET  SUV 0–10", "SPECT/PET  0–1250").
+    """
+    if kind in ("CT", "MRI"):
+        return f"{kind}  W {formatWindowNumber(window)}  L {formatWindowNumber(level)}"
+    lower, upper = level - window / 2.0, level + window / 2.0
+    unitText = f"{unit} " if unit else ""
+    return f"{kind}  {unitText}{formatWindowNumber(lower)}–{formatWindowNumber(upper)}"
+
+
+def voxelUnitLabel(volumeNode):
+    """ "SUV" for SUV images (from the voxel value units, else the name), else the units' short text or "". """
+    if volumeNode is None:
+        return ""
+    texts = []
+    try:
+        units = volumeNode.GetVoxelValueUnits()
+        if units is not None:
+            texts = [units.GetCodeValue() or "", units.GetCodeMeaning() or ""]
+    except Exception:
+        pass
+    if any("SUV" in text.upper() for text in texts) or "SUV" in (volumeNode.GetName() or "").upper():
+        return "SUV"
+    meaning = texts[1] if len(texts) > 1 else ""
+    return meaning if meaning and len(meaning) <= 12 else ""
 
 
 def hotIronRGB(t):
@@ -590,26 +844,133 @@ def sphereStatisticsFromArray(voxels, ijkToRas, centerRas, radiusMm,
     }
 
 
-def formatRoiLabel(name, stats, hasPet):
-    """Annotation shown next to the ROI in the views (multi-line)."""
+def formatRoiThreshold(mode, value):
+    """Stored form of an ROI's threshold: "relative 40" / "absolute 2.5"."""
+    mode = mode if mode in (THRESHOLD_RELATIVE, THRESHOLD_ABSOLUTE) else THRESHOLD_RELATIVE
+    return f"{mode} {float(value):g}"
+
+
+def parseRoiThreshold(text):
+    """(mode, value) from formatRoiThreshold's text, or None if the text is not a valid threshold."""
+    parts = (text or "").split()
+    if len(parts) != 2 or parts[0] not in (THRESHOLD_RELATIVE, THRESHOLD_ABSOLUTE):
+        return None
+    try:
+        value = float(parts[1])
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return parts[0], value
+
+
+def describeRoiThreshold(mode, value):
+    """Short text for the table and the view labels: "40%" / "2.5 SUV"."""
+    return f"{float(value):g} SUV" if mode == THRESHOLD_ABSOLUTE else f"{float(value):g}%"
+
+
+def parseRoiLabelFields(text):
+    """Label fields from their stored form ("name,max,mean"); None (never set) gives the defaults."""
+    if text is None:
+        return tuple(DEFAULT_ROI_LABEL_FIELDS)
+    wanted = {part.strip() for part in str(text).split(",")}
+    return tuple(key for key, _ in ROI_LABEL_FIELDS if key in wanted)
+
+
+def formatRoiLabel(name, stats, hasPet, fields=DEFAULT_ROI_LABEL_FIELDS, radius=None, threshold=None):
+    """
+    Text shown next to the ROI in the views: the chosen fields, one per line ("" when none is chosen).
+    Mean is the mean of the thresholded segment. threshold: (mode, value) of this ROI.
+    """
+    fields = set(fields)
+    lines = [name] if "name" in fields else []
     if stats is None:
-        return f"{name}\n(outside PET)" if hasPet else f"{name}\n(no PET)"
-    segMean = stats.get("segMean")
-    segText = f"{segMean:.2f}" if segMean is not None else "-"
-    return f"{name}\nMax {stats['max']:.2f}\nMean {segText}"  # Mean = thresholded segment mean
+        lines.append("(outside PET)" if hasPet else "(no PET)")
+    else:
+        segMean = stats.get("segMean")
+        if "max" in fields:
+            lines.append(f"Max {stats['max']:.2f}")
+        if "mean" in fields:
+            lines.append(f"Mean {segMean:.2f}" if segMean is not None else "Mean -")
+        if "mtv" in fields:
+            lines.append(f"MTV {stats.get('mtvMl', 0.0):.2f} mL")
+        if "tlg" in fields:
+            lines.append(f"TLG {stats.get('tlg', 0.0):.2f}")
+    if "radius" in fields and radius is not None:
+        lines.append(f"r {float(radius):.1f} mm")
+    if "threshold" in fields and threshold is not None:
+        lines.append(f"Thr {describeRoiThreshold(*threshold)}")
+    return "\n".join(lines)
 
 
-def formatRoiTableRow(name, radius, stats):
-    """ROI | r (mm) | Max | Mean | Seg Mean | MTV (mL) | TLG"""
-    values = [name, f"{radius:.1f}", "-", "-", "-", "-", "-"]
+def formatRoiTableRow(name, radius, stats, threshold=None):
+    """ROI | r (mm) | Thr. | Max | Mean | MTV (mL) | TLG   (Mean = mean of the thresholded segment)"""
+    values = [name, f"{radius:.1f}", describeRoiThreshold(*threshold) if threshold else "-", "-", "-", "-", "-"]
     if stats is not None:
-        values[2] = f"{stats['max']:.2f}"
-        values[3] = f"{stats['mean']:.2f}"
+        values[3] = f"{stats['max']:.2f}"
         if stats.get("segMean") is not None:
             values[4] = f"{stats['segMean']:.2f}"
         values[5] = f"{stats.get('mtvMl', 0.0):.2f}"
         values[6] = f"{stats.get('tlg', 0.0):.2f}"
     return values
+
+
+ROI_TSV_COLUMNS = [
+    "ROI", "Origin", "Center R (mm)", "Center A (mm)", "Center S (mm)", "Radius (mm)",
+    "Threshold mode", "Threshold setting", "Threshold (SUV)",
+    "SUVmax", "SUVmean sphere", "Sphere volume (mL)",
+    "SUVmean segment", "MTV (mL)", "TLG", "Segment voxels",
+    "PET volume", "PET filter",
+]
+
+
+def _tsvCell(value, digits=4):
+    """One TSV cell: numbers at fixed precision, None / NaN empty, tabs and line breaks removed from text."""
+    if value is None:
+        return ""
+    if isinstance(value, (bool, np.bool_)):
+        return str(bool(value))
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.{digits}f}" if math.isfinite(value) else ""
+    return re.sub(r"[\t\r\n]+", " ", str(value)).strip()
+
+
+def formatRoiTableTsv(rows, centers=None, petName="", petFilter=""):
+    """
+    ROI table as tab-separated text (header + one line per ROI), at full precision rather than the
+    rounded values shown in the panel.
+    rows:    (pointID, name, radius, stats, threshold, origin) as in the ROI table
+    centers: {pointID: (R, A, S)} ROI centers in world coordinates (mm)
+    """
+    centers = centers or {}
+    lines = ["\t".join(ROI_TSV_COLUMNS)]
+    for pointID, name, radius, stats, threshold, origin in rows:
+        center = centers.get(pointID) or (None, None, None)
+        mode, setting = threshold if threshold else (None, None)
+        stats = stats or {}
+        values = [
+            name, origin or ROI_ORIGIN_USER,
+            _tsvCell(center[0], 2), _tsvCell(center[1], 2), _tsvCell(center[2], 2),
+            _tsvCell(radius, 2),
+            mode or "",
+            (describeRoiThreshold(mode, setting) if mode is not None else ""),
+            _tsvCell(stats.get("threshold")),
+            _tsvCell(stats.get("max")), _tsvCell(stats.get("mean")), _tsvCell(stats.get("volumeMl")),
+            _tsvCell(stats.get("segMean")), _tsvCell(stats.get("mtvMl")),
+            _tsvCell(stats.get("tlg") if stats else None), _tsvCell(stats.get("segVoxels")),
+            petName or "", petFilter or "",
+        ]
+        lines.append("\t".join(_tsvCell(value) for value in values))
+    return "\n".join(lines) + "\n"
+
+
+def defaultRoiExportFileName(petName, timestamp=None):
+    """e.g. "PT_Patient1_SUV_ROIs_20260920-143000.tsv" (characters unsafe in file names replaced)."""
+    stamp = timestamp or time.strftime("%Y%m%d-%H%M%S")
+    base = re.sub(r"[^\w.\-]+", "_", petName or "").strip("._")
+    return f"{base + '_' if base else ''}SUV_ROIs_{stamp}.tsv"
 
 
 def randomRoiColor(rng=random):
@@ -686,6 +1047,202 @@ def resolveHandleDrag(center, radius, lastGeometry, handles, activeHandleID, tol
     return _distance(dragged[1], center), dragged[0]
 
 
+class FilterCancelled(Exception):
+    """Raised by the progress callback of a filter run when the user pressed Cancel."""
+
+
+def parseFilterMetadata(text):
+    """
+    Model parameters from a PETDenoise sidecar file (<model>.txt next to <model>.pth), read the way the PETDenoise
+    module reads them: same keys, same defaults, and (as there) a voxel_spacing line switches resampling back on.
+
+    Returns (params, notes). params has every key of FILTER_DEFAULT_PARAMETERS (+ "modality" if the file has one).
+    notes maps every other "key: value" line (lower-case key) to (key as written, value), e.g. the SUV biases.
+    """
+    params = dict(FILTER_DEFAULT_PARAMETERS)
+    notes = {}
+    for line in (text or "").splitlines():
+        if ":" not in line:
+            continue
+        rawKey, value = line.split(":", 1)
+        rawKey, value = rawKey.strip().lstrip("\ufeff"), value.strip()
+        key = rawKey.lower()
+        if not key:
+            continue
+        try:
+            if key in ("dual_channel", "dont_resample", "prevent_negative"):
+                params[key] = value.lower() == "true"
+            elif key in ("voxel_spacing", "block_size"):
+                values = tuple(ast.literal_eval(value))
+                if len(values) != 3:
+                    raise ValueError("three values expected")
+                if key == "voxel_spacing":
+                    params[key] = tuple(float(v) for v in values)
+                    params["dont_resample"] = False
+                else:
+                    params[key] = tuple(int(v) for v in values)
+            elif key in ("strides", "channels", "num_heads", "depths"):
+                params[key] = tuple(int(v) for v in ast.literal_eval(value))
+            elif key in ("res_units", "down_kernel", "up_kernel", "feature_size"):
+                params[key] = int(value)
+            elif key == "do_rate":
+                params[key] = float(value)
+            elif key == "architecture":
+                # As in PETDenoise: anything other than UNET / SwinUNETR selects SwinUNETR+GCFN
+                params[key] = value if value in ("UNET", "SwinUNETR") else "SwinUNETR+GCFN"
+            elif key == "modality":
+                params[key] = value
+            else:
+                notes[key] = (rawKey, value)
+        except (ValueError, SyntaxError, TypeError):
+            logging.warning(f"EasyFusion: ignored model parameter line '{rawKey}: {value}'")
+    return params, notes
+
+
+def filterSuvNotes(notes):
+    """Sidecar lines whose key starts with "SUV" (e.g. "SUVmax Bias: -0.28 g/mL"), as written, for the warning."""
+    return [f"{rawKey}: {value}" for key, (rawKey, value) in notes.items() if key.startswith("suv")]
+
+
+def guessFilterTarget(modelName, params):
+    """
+    Volume a model is meant for. A "modality" line in the sidecar decides (CT... / MR... -> CT/MRI, else SPECT/PET).
+    Without one, a file name containing a separate word CT, MR or MRI (e.g. CT_superres24.pth) means CT/MRI.
+    """
+    modality = str(params.get("modality") or "").strip().lower()
+    if modality:
+        return FILTER_TARGET_CT if modality.startswith(("ct", "mr")) else FILTER_TARGET_PET
+    stem = os.path.splitext(os.path.basename(modelName or ""))[0].lower()
+    return FILTER_TARGET_CT if re.search(r"(^|[^a-z])(ct|mr|mri)([^a-z]|$)", stem) else FILTER_TARGET_PET
+
+
+def resampledGridShape(dimensionsIjk, spacing, targetSpacing):
+    """Approximate array shape (k, j, i) of a volume after resampling to targetSpacing (None: not resampled)."""
+    if targetSpacing is None:
+        dims = [int(d) for d in dimensionsIjk]
+    else:
+        dims = [max(1, int(round(d * s / t))) for d, s, t in zip(dimensionsIjk, spacing, targetSpacing)]
+    return tuple(dims[::-1])
+
+
+def estimateSlidingWindowCount(imageShape, roiSize, overlap=FILTER_WINDOW_OVERLAP):
+    """
+    Number of windows MONAI's sliding_window_inference evaluates (= predictor calls with sw_batch_size=1).
+    Same arithmetic as monai.inferers.utils (_get_scan_interval, dense_patch_slices). Drives the progress bar.
+    """
+    total = 1
+    for size, roi in zip(imageShape, roiSize):
+        roi = int(roi)
+        size = max(int(size), roi)  # MONAI pads the image up to the window size
+        interval = roi if roi == size else max(int(roi * (1.0 - overlap)), 1)
+        count = int(math.ceil(float(size) / interval))
+        first = next((d for d in range(count) if d * interval + roi >= size), None)
+        total *= first + 1 if first is not None else 1
+    return total
+
+
+def filterJobSize(dimensionsIjk, spacing, params, channels=1):
+    """
+    Size of a filter run on a volume with these dimensions (i, j, k) and spacing: grid shape (k, j, i) on the
+    model's voxel grid, voxel count, rough peak memory, number of windows, and whether it counts as large.
+    """
+    targetSpacing = None if params["dont_resample"] else params["voxel_spacing"]
+    shape = resampledGridShape(dimensionsIjk, spacing, targetSpacing)
+    voxels = math.prod(shape)  # Python ints: no overflow for huge grids
+    memoryBytes = float(voxels) * 4 * (FILTER_MEMORY_COPIES + channels - 1)
+    windows = estimateSlidingWindowCount(shape, params["block_size"])
+    work = float(windows) * math.prod(int(v) for v in params["block_size"])
+    return {"shape": shape, "voxels": voxels, "memoryBytes": memoryBytes, "windows": windows,
+            "large": memoryBytes >= FILTER_LARGE_MEMORY_BYTES or work >= FILTER_LARGE_WORK_VOXELS}
+
+
+def voxelCopyRegion(sourceIjkToRas, sourceShape, croppedIjkToRas, croppedShape, tolerance=1e-3):
+    """
+    Where a voxel-based crop lies in its source volume. Shapes are array shapes [k, j, i] (as arrayFromVolume);
+    matrices are IJK -> RAS (4x4).
+
+    Returns (sourceSlices, croppedSlices, firstSourceIjk): the block both volumes share, as [k, j, i] slice tuples,
+    and the source IJK index of its first voxel. Voxels of the crop outside the source (padding) are left out.
+    Raises ValueError("resampled") if the crop is not on the source's voxel grid (other voxel size or axes, or
+    shifted by a fraction of a voxel, i.e. interpolated), ValueError("outside") if it shares no voxel with it.
+    """
+    source = np.asarray(sourceIjkToRas, dtype=float)
+    cropped = np.asarray(croppedIjkToRas, dtype=float)
+    scale = max(float(np.abs(source[:3, :3]).max()), 1e-12)
+    if not np.allclose(source[:3, :3], cropped[:3, :3], rtol=0.0, atol=1e-6 * scale):
+        raise ValueError("resampled")
+    offset = np.linalg.solve(source[:3, :3], cropped[:3, 3] - source[:3, 3])  # crop voxel (0,0,0) in source IJK
+    rounded = np.round(offset)
+    if np.any(np.abs(offset - rounded) > tolerance):
+        raise ValueError("resampled")
+    offset = rounded.astype(int)
+    sourceDims = np.array(sourceShape[:3][::-1])    # (i, j, k)
+    croppedDims = np.array(croppedShape[:3][::-1])
+    lo = np.maximum(offset, 0)
+    hi = np.minimum(offset + croppedDims, sourceDims)
+    if np.any(hi <= lo):
+        raise ValueError("outside")
+    sourceSlices = tuple(slice(int(lo[a]), int(hi[a])) for a in (2, 1, 0))
+    croppedSlices = tuple(slice(int(lo[a] - offset[a]), int(hi[a] - offset[a])) for a in (2, 1, 0))
+    return sourceSlices, croppedSlices, tuple(int(v) for v in lo)
+
+
+def boxSurfacePoints(size, samplesPerEdge=FILTER_CROP_SAMPLES_PER_EDGE):
+    """
+    Points on the surface of a box of the given size (x, y, z) centered at the origin (an ROI's object coordinates):
+    a samplesPerEdge x samplesPerEdge grid on each face, corners and edges included. Under a smooth deformation the
+    image of the surface encloses the image of the whole box, so these points are enough to bound it.
+    """
+    half = np.asarray(size, dtype=float) / 2.0
+    n = max(int(samplesPerEdge), 2)
+    t = np.linspace(-1.0, 1.0, n)
+    u, v = np.meshgrid(t, t, indexing="ij")
+    faces = []
+    for axis in range(3):
+        a, b = [x for x in range(3) if x != axis]
+        for side in (-1.0, 1.0):
+            face = np.empty((u.size, 3))
+            face[:, axis] = side
+            face[:, a] = u.ravel()
+            face[:, b] = v.ravel()
+            faces.append(face)
+    return np.unique(np.vstack(faces), axis=0) * half
+
+
+def voxelBlockFromIjkPoints(ijkPoints, dimensions, margin=0):
+    """
+    Smallest block of voxels touched by the given continuous IJK points (voxel centers at integer IJK), grown by
+    margin voxels and clipped to the volume. dimensions: (I, J, K) as vtkImageData.GetDimensions().
+    Returns (lo, hi) as (i, j, k) integer tuples, hi exclusive, or None if the block misses the volume.
+    Non-finite points (e.g. where an inverse transform did not converge) are ignored.
+    """
+    points = np.asarray(ijkPoints, dtype=float).reshape(-1, 3)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if points.size == 0:
+        return None
+    dims = np.asarray(dimensions[:3], dtype=int)
+    lo = np.floor(points.min(axis=0) + 0.5).astype(int) - int(margin)   # voxel containing the lowest point
+    hi = np.floor(points.max(axis=0) + 0.5).astype(int) + 1 + int(margin)
+    lo = np.maximum(lo, 0)
+    hi = np.minimum(hi, dims)
+    if np.any(hi <= lo):
+        return None
+    return tuple(int(x) for x in lo), tuple(int(x) for x in hi)
+
+def castFilterResult(array, dtype):
+    """Filtered voxels in the input's voxel type. Integer types are rounded (not truncated) and kept in range."""
+    dtype = np.dtype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        limits = np.iinfo(dtype)
+        return np.clip(np.rint(array), limits.min, limits.max).astype(dtype)
+    return np.asarray(array).astype(dtype, copy=False)
+
+
+def formatByteSize(numberOfBytes):
+    gigabytes = numberOfBytes / 1024.0 ** 3
+    return f"{gigabytes:.1f} GB" if gigabytes >= 1.0 else f"{numberOfBytes / 1024.0 ** 2:.0f} MB"
+
+
 # ---------------------------------------------------------------------------
 # Widget
 # ---------------------------------------------------------------------------
@@ -703,15 +1260,27 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._updatingRois = False
         self._roiStatsCache = {}
         self._knownRoiIDs = None
+        self._suppressInputUpdate = 0    # > 0 while the panel itself sets the volume selectors
+        self._mriSample = (None, None)   # ((node ID, image MTime), tissue sample) for the MRI presets
+        self._roiTableRows = []          # rows currently shown in the ROI table (for the TSV export)
+        self._roiCenters = {}            # ROI control point ID -> center (world, mm) at last update
         self._lastRoiGeometry = {}       # ROI control point ID -> (center, radius) at last sync
         self._lastHandlePositions = {}   # handle control point ID -> position at last sync
         self._activeHandleID = None      # handle currently being dragged
         self._panelButtons = []
         self.mipOverlay = MipRoiOverlay()
+        self.windowInfoOverlay = SliceWindowInfoOverlay(
+            lambda: (self.inputVolumeSelector.currentNode(), self.inputVolumeSelectorCT.currentNode()))
+        self.filterLogic = None
+        self._filterRunning = False
+        self._filterParams = None     # parameters of the selected model (from its .txt sidecar)
+        self._filterNotes = {}        # other sidecar lines (training data, reported SUV bias, ...)
+        self.filterCropRoiNode = None  # adjustable box of "Limit to ROI"
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
         self.logic = Easy_fusionLogic()
+        self.filterLogic = Easy_fusionFilterLogic()
 
         parametersCollapsibleButton = ctk.ctkCollapsibleButton()
         parametersCollapsibleButton.text = "Parameters"
@@ -770,6 +1339,13 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
              for percent in SPECT_PERCENT_OF_MAX_PRESETS],
             toolTip="Window from 0 to this percentage of the maximum count (voxel value) in the SPECT/PET volume."))
 
+        formLayout.addRow("MRI Presets (relative):", self._buttonRow([
+            (text, lambda low=low, high=high, text=text: self.setMRIWindowPercentile(low, high, text),
+             f"Window from percentile {low:g} to {high:g} of the tissue intensities in the CT/MRI volume\n"
+             f"(air and background left out), for MRI or any image without absolute units.\n"
+             f"Shortcut: {key} with the mouse over a CT/MRI view when that volume is an MRI.")
+            for text, low, high, key in MRI_PERCENTILE_PRESETS]))
+
         # PET color maps (two rows, no label on the second)
         for rowIndex, row in enumerate(PET_COLOR_MAP_BUTTONS):
             formLayout.addRow("PET Color Maps:" if rowIndex == 0 else "", self._buttonRow([
@@ -782,13 +1358,14 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.setupLayoutSection()
         self.setupMeasurementSection()
+        self.setupFilterSection()
 
-        self.layout.addStretch(1)
+
 
         bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Icons", "fusbanner.jpg")
         if os.path.exists(bannerPath):
             bannerLabel = qt.QLabel()
-            bannerLabel.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(400, qt.Qt.SmoothTransformation))
+            bannerLabel.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(600, qt.Qt.SmoothTransformation))
             bannerLabel.setAlignment(qt.Qt.AlignCenter)
             self.layout.addWidget(bannerLabel)
         else:
@@ -812,12 +1389,20 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         addPostLoadListener(self.onSceneLoaded)  # runs after the scene repairs, in the same deferred pass
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.NodeAboutToBeRemovedEvent, self.onNodeAboutToBeRemoved)
         self.inputVolumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onPETVolumeChanged)
+        # After the first "Go": a new SPECT/PET or CT/MRI selection updates the views right away
+        self.inputUpdateTimer = qt.QTimer()
+        self.inputUpdateTimer.setSingleShot(True)
+        self.inputUpdateTimer.setInterval(INPUT_UPDATE_DELAY_MS)
+        self.inputUpdateTimer.connect('timeout()', self.applyChangedInputVolumes)
+        self.inputVolumeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onInputVolumeSelectionChanged)
+        self.inputVolumeSelectorCT.connect("currentNodeChanged(vtkMRMLNode*)", self.onInputVolumeSelectionChanged)
         if slicer.app.layoutManager() is not None:
             slicer.app.layoutManager().connect("layoutChanged(int)", self.onLayoutChanged)
 
         self.observeThreeDViewNode()
-        self.restoreFromSettings()
-        self.connectToExistingRois()
+        with self.selectorsSetByPanel():
+            self.restoreFromSettings()
+            self.connectToExistingRois()
         self.onLayoutChanged()
 
     @staticmethod
@@ -902,12 +1487,166 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.layoutButtons[layoutID] = button
         layoutFormLayout.addRow(buttonGrid)
 
+        # Text in the slice views
+        textRow = qt.QHBoxLayout()
+        self.sliceAnnotationsButton = qt.QPushButton("Slicer Annotations")
+        self.sliceAnnotationsButton.checkable = True
+        self.sliceAnnotationsButton.setToolTip(
+            "Show or hide Slicer's built-in slice view annotations (Data Probe): patient and study\n"
+            "information and the names of the shown volumes in the corners of the slice views.\n"
+            "It switches Slicer's active corners (top left, top right, bottom left), as Slicer's own\n"
+            "settings do, so the choice is remembered after a restart. Showing them again restores the\n"
+            "corners that were on before.")
+        self.sliceAnnotationsButton.connect("toggled(bool)", self.onSlicerAnnotationsToggled)
+        textRow.addWidget(self.sliceAnnotationsButton)
+        self.windowInfoButton = qt.QPushButton("Window Info (bottom right)")
+        self.windowInfoButton.checkable = True
+        self.windowInfoButton.setToolTip(
+            "Show the current windowing in the bottom-right corner of every slice view:\n"
+            "CT (or MRI) window / level, and the SPECT/PET display range (in SUV for PET).\n"
+            "Fusion views show both. It follows presets, F5-F9 and mouse window / level drags.")
+        self.windowInfoButton.connect("toggled(bool)", self.onWindowInfoToggled)
+        textRow.addWidget(self.windowInfoButton)
+        layoutFormLayout.addRow("Slice view text:", textRow)
+
+        showWindowInfo = str(qt.QSettings().value(SETTINGS_SHOW_WINDOW_INFO, "true")).lower() in ("true", "1")
+        self.windowInfoOverlay.enabled = showWindowInfo
+        wasBlocked = self.windowInfoButton.blockSignals(True)
+        self.windowInfoButton.checked = showWindowInfo
+        self.windowInfoButton.blockSignals(wasBlocked)
+        self.syncSlicerAnnotationsButton()
+
+    # --- Slice view text ------------------------------------------------------
+
+    @staticmethod
+    def slicerSliceAnnotations():
+        """Slicer's slice view annotations object (Data Probe module), or None when it is not available."""
+        try:
+            return slicer.modules.DataProbeInstance.infoWidget.sliceAnnotations
+        except AttributeError:
+            return None
+
+    @staticmethod
+    def _slicerAnnotationCorners(annotations):
+        """[0/1 per corner of DATA_PROBE_CORNERS], or None if this Slicer version has no per-corner switches."""
+        if not all(hasattr(annotations, attribute) for attribute, _, _ in DATA_PROBE_CORNERS):
+            return None
+        return [1 if getattr(annotations, attribute) else 0 for attribute, _, _ in DATA_PROBE_CORNERS]
+
+    def slicerAnnotationsShown(self):
+        annotations = self.slicerSliceAnnotations()
+        if annotations is None:
+            return False
+        corners = self._slicerAnnotationCorners(annotations)
+        return bool(annotations.sliceViewAnnotationsEnabled) and (corners is None or any(corners))
+
+    def syncSlicerAnnotationsButton(self):
+        """The button shows Slicer's current state (it may have been changed in Slicer's settings)."""
+        if not hasattr(self, "sliceAnnotationsButton"):
+            return
+        annotations = self.slicerSliceAnnotations()
+        self.sliceAnnotationsButton.enabled = annotations is not None
+        if annotations is None:
+            return
+        wasBlocked = self.sliceAnnotationsButton.blockSignals(True)
+        self.sliceAnnotationsButton.checked = self.slicerAnnotationsShown()
+        self.sliceAnnotationsButton.blockSignals(wasBlocked)
+
+    @staticmethod
+    def _setCheckBox(annotations, checkBoxName, checked):
+        """Mirror a change in Slicer's own settings panel (if it was created), without triggering it."""
+        checkBox = getattr(annotations, checkBoxName, None)
+        if checkBox is None:
+            return
+        try:
+            wasBlocked = checkBox.blockSignals(True)
+            checkBox.checked = bool(checked)
+            checkBox.blockSignals(wasBlocked)
+        except Exception:
+            logging.debug(f"EasyFusion: could not update Slicer's {checkBoxName}", exc_info=True)
+
+    def _clearSlicerCornerTexts(self, cornerIndexes):
+        """Blank Slicer's corner texts right away (they are otherwise only rewritten on the next view change)."""
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return
+        for name in layoutManager.sliceViewNames():
+            sliceWidget = layoutManager.sliceWidget(name)
+            sliceView = sliceWidget.sliceView() if sliceWidget is not None else None
+            if sliceView is None:
+                continue
+            cornerAnnotation = sliceView.cornerAnnotation()
+            for index in cornerIndexes:
+                cornerAnnotation.SetText(index, "")
+            sliceView.scheduleRender()
+
+    def onSlicerAnnotationsToggled(self, enabled):
+        """
+        Show / hide Slicer's slice view annotations. Turning off only Slicer's master switch leaves the texts
+        already drawn in the views, so this switches the active corners (top left, top right, bottom left),
+        as Slicer's settings panel does, and remembers which were on so that showing them restores them.
+        """
+        annotations = self.slicerSliceAnnotations()
+        if annotations is None:
+            slicer.util.showStatusMessage("EasyFusion: Slicer's slice view annotations (Data Probe) are not available.",
+                                          3000)
+            self.syncSlicerAnnotationsButton()
+            return
+        settings = qt.QSettings()
+        try:
+            corners = self._slicerAnnotationCorners(annotations)
+            if corners is None:
+                # Older Slicer without per-corner switches: master switch, then blank the views ourselves
+                annotations.sliceViewAnnotationsEnabled = 1 if enabled else 0
+                self._setCheckBox(annotations, "sliceViewAnnotationsCheckBox", enabled)
+                settings.setValue(DATA_PROBE_ANNOTATIONS_SETTING, 1 if enabled else 0)
+                annotations.updateSliceViewFromGUI()
+                if not enabled:
+                    self._clearSlicerCornerTexts(DATA_PROBE_CORNER_INDEXES)
+                return
+
+            if enabled:
+                saved = str(settings.value(SETTINGS_SLICER_ANNOTATION_CORNERS, "") or "").split(",")
+                wanted = [1 if value.strip() == "1" else 0 for value in saved] if len(saved) == len(corners) else []
+                if not any(wanted):
+                    wanted = [1] * len(corners)  # nothing remembered (or all were off): show every corner
+            else:
+                if any(corners):
+                    settings.setValue(SETTINGS_SLICER_ANNOTATION_CORNERS, ",".join(str(c) for c in corners))
+                wanted = [0] * len(corners)
+
+            # The master switch stays on: the annotations must keep updating to draw (or blank) the corners
+            annotations.sliceViewAnnotationsEnabled = 1
+            self._setCheckBox(annotations, "sliceViewAnnotationsCheckBox", True)
+            settings.setValue(DATA_PROBE_ANNOTATIONS_SETTING, 1)
+            for (attribute, checkBoxName, settingName), value in zip(DATA_PROBE_CORNERS, wanted):
+                setattr(annotations, attribute, value)
+                self._setCheckBox(annotations, checkBoxName, value)
+                settings.setValue(settingName, value)
+            if hasattr(annotations, "updateEnabledButtons"):
+                annotations.updateEnabledButtons()
+            annotations.updateSliceViewFromGUI()
+            if not enabled:
+                self._clearSlicerCornerTexts(DATA_PROBE_CORNER_INDEXES)
+        except Exception:
+            logging.exception("EasyFusion: could not switch Slicer's slice view annotations")
+        finally:
+            self.syncSlicerAnnotationsButton()
+
+    def onWindowInfoToggled(self, enabled):
+        qt.QSettings().setValue(SETTINGS_SHOW_WINDOW_INFO, "true" if enabled else "false")
+        self.windowInfoOverlay.setEnabled(enabled)
+
 
     def setupMeasurementSection(self):
         measurementCollapsibleButton = ctk.ctkCollapsibleButton()
         measurementCollapsibleButton.text = "SUV Measurements (spherical ROI)"
         self.layout.addWidget(measurementCollapsibleButton)
         measurementLayout = qt.QFormLayout(measurementCollapsibleButton)
+
+        self.roitipLabel = qt.QLabel("Press 'Insert' key to place ROIs")
+        self.roitipLabel.setStyleSheet("color: red; font-weight: bold;")
+        measurementLayout.addRow(self.roitipLabel)
 
         self.roiRadiusSpinBox = qt.QDoubleSpinBox()
         self.roiRadiusSpinBox.setRange(1.0, 100.0)
@@ -916,7 +1655,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.roiRadiusSpinBox.setSuffix(" mm")
         self.roiRadiusSpinBox.setValue(DEFAULT_ROI_RADIUS_MM)
         self.roiRadiusSpinBox.setToolTip(
-            "Radius used for new ROIs. When an ROI is selected in the table, this changes that ROI's radius.")
+            "Radius of the ROI selected in the table. With no ROI selected: the radius given to new ROIs.")
         measurementLayout.addRow("ROI radius:", self.roiRadiusSpinBox)
 
         roiButtonsLayout = qt.QHBoxLayout()
@@ -938,7 +1677,9 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.thresholdModeComboBox.addItem("Absolute SUV", THRESHOLD_ABSOLUTE)
         self.thresholdModeComboBox.setToolTip(
             "Relative: segment = voxels inside the ROI with SUV >= this % of the ROI's Max.\n"
-            "Absolute: segment = voxels inside the ROI with SUV >= this value.")
+            "Absolute: segment = voxels inside the ROI with SUV >= this value.\n"
+            "Each ROI keeps its own threshold: this changes only the ROI selected in the table.\n"
+            "With no ROI selected, it sets the threshold given to new ROIs.")
         self.thresholdValueSpinBox = qt.QDoubleSpinBox()
         self.thresholdValueSpinBox.setDecimals(1)
         thresholdLayout.addWidget(self.thresholdModeComboBox)
@@ -948,7 +1689,18 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._absoluteThreshold = DEFAULT_ABSOLUTE_THRESHOLD
         self._applyThresholdModeToSpinBox(THRESHOLD_RELATIVE)
 
+        # Which ROI the radius / threshold controls edit right now
+        editTargetLayout = qt.QHBoxLayout()
+        self.roiEditTargetLabel = qt.QLabel()
+        self.roiEditTargetLabel.setStyleSheet("color: gray;")
+        self.roiDeselectButton = qt.QPushButton("Deselect")
+        self.roiDeselectButton.setToolTip("Deselect the ROI, so radius and threshold set the values for new ROIs.")
+        editTargetLayout.addWidget(self.roiEditTargetLabel, 1)
+        editTargetLayout.addWidget(self.roiDeselectButton)
+        measurementLayout.addRow(editTargetLayout)
+
         self.roiPetLabel = qt.QLabel("Measuring on: (no PET selected)")
+        self.roiPetLabel.wordWrap = True
         measurementLayout.addRow(self.roiPetLabel)
 
         self.showRoisOnMipCheckBox = qt.QCheckBox("Show ROI segments and values on the MIP (3D view)")
@@ -958,12 +1710,25 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             "Display only: nothing is added to the scene or saved.")
         measurementLayout.addRow(self.showRoisOnMipCheckBox)
 
+        # Values drawn next to each ROI in the slice views and on the MIP
+        labelFieldsLayout = qt.QGridLayout()
+        shownFields = parseRoiLabelFields(qt.QSettings().value(SETTINGS_ROI_LABEL_FIELDS))
+        self.roiLabelFieldCheckBoxes = {}
+        for position, (key, text) in enumerate(ROI_LABEL_FIELDS):
+            checkBox = qt.QCheckBox(text)
+            checkBox.checked = key in shownFields
+            checkBox.connect('toggled(bool)', self.onRoiLabelFieldsChanged)
+            labelFieldsLayout.addWidget(checkBox, position // 4, position % 4)
+            self.roiLabelFieldCheckBoxes[key] = checkBox
+        measurementLayout.addRow("Show near ROI:", labelFieldsLayout)
+
         self.roiTable = qt.QTableWidget()
         self.roiTable.setColumnCount(7)
-        self.roiTable.setHorizontalHeaderLabels(["ROI", "r (mm)", "Max", "Mean", "Seg Mean", "MTV (mL)", "TLG"])
-        headerTips = ["", "ROI radius", "Maximum SUV inside the ROI sphere", "Mean SUV of the whole ROI sphere",
-                      "Mean SUV of the thresholded segment", "Metabolic tumor volume: volume of the thresholded segment",
-                      "Total lesion glycolysis = Seg Mean x MTV"]
+        self.roiTable.setHorizontalHeaderLabels(["ROI", "r (mm)", "Thr.", "Max", "Mean", "MTV (mL)", "TLG"])
+        headerTips = ["", "ROI radius", "Segment threshold of this ROI (% of its Max, or absolute SUV)",
+                      "Maximum SUV inside the ROI sphere", "Mean SUV of the thresholded segment",
+                      "Metabolic tumor volume: volume of the thresholded segment",
+                      "Total lesion glycolysis = Mean x MTV"]
         for column, tip in enumerate(headerTips):
             headerItem = self.roiTable.horizontalHeaderItem(column)
             if headerItem is not None and tip:
@@ -975,12 +1740,26 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.roiTable.horizontalHeader().setStretchLastSection(True)
         self.roiTable.verticalHeader().setVisible(False)
         self.roiTable.setMinimumHeight(140)
-        self.roiTable.setToolTip("Select a row to jump the slice views to that ROI.")
+        self.roiTable.setToolTip("Select a row to jump to that ROI and edit its radius and threshold.")
         measurementLayout.addRow(self.roiTable)
+
+        exportLayout = qt.QHBoxLayout()
+        exportLayout.addStretch(1)
+        self.exportRoiTableButton = qt.QPushButton("Export Table (.tsv)…")
+        self.exportRoiTableButton.setToolTip(
+            "Save all ROIs to a tab-separated file (opens in Excel, LibreOffice, R, Python ...).\n"
+            "Values are written at full precision, with ROI centers (RAS, mm), sphere and segment\n"
+            "statistics, threshold in SUV and the PET volume they were measured on.")
+        self.exportRoiTableButton.enabled = False
+        exportLayout.addWidget(self.exportRoiTableButton)
+        measurementLayout.addRow(exportLayout)
 
         self.placeRoiButton.connect('clicked()', self.onPlaceRoi)
         self.deleteRoiButton.connect('clicked()', self.onDeleteSelectedRoi)
         self.clearRoisButton.connect('clicked()', self.onClearRois)
+        self.roiDeselectButton.connect('clicked()', self.onDeselectRoi)
+        self.exportRoiTableButton.connect('clicked()', self.onExportRoiTable)
+        self.updateRoiEditTarget()
         self.roiRadiusSpinBox.connect('valueChanged(double)', self.onRoiRadiusChanged)
         self.roiTable.connect('itemSelectionChanged()', self.onRoiSelectionChanged)
         self.thresholdModeComboBox.connect('currentIndexChanged(int)', self.onThresholdModeChanged)
@@ -996,17 +1775,93 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Insert key: drop an ROI at the mouse cursor
         self._addApplicationShortcut(qt.Qt.Key_Insert, self.onPlaceRoiAtCursor)
 
+    def setupFilterSection(self):
+        filterCollapsibleButton = ctk.ctkCollapsibleButton()
+        filterCollapsibleButton.text = "Post-processing Filters (AI)"
+        filterCollapsibleButton.collapsed = True
+        self.layout.addWidget(filterCollapsibleButton)
+        filterLayout = qt.QFormLayout(filterCollapsibleButton)
+
+        folderLayout = qt.QHBoxLayout()
+        self.filterModelFolderEdit = qt.QLineEdit()
+        self.filterModelFolderEdit.readOnly = True
+        self.filterModelFolderEdit.placeholderText = "Folder with the .pth models and their .txt files"
+        self.filterModelFolderButton = qt.QPushButton("Browse…")
+        folderLayout.addWidget(self.filterModelFolderEdit)
+        folderLayout.addWidget(self.filterModelFolderButton)
+        filterLayout.addRow("Model folder:", folderLayout)
+
+        self.filterModelSelector = qt.QComboBox()
+        self.filterModelSelector.setToolTip("Denoising / super-resolution model (PETDenoise .pth file).")
+        filterLayout.addRow("Model:", self.filterModelSelector)
+
+        self.filterInfoBox = qt.QPlainTextEdit()
+        self.filterInfoBox.readOnly = True
+        self.filterInfoBox.setMaximumHeight(120)
+        self.filterInfoBox.setToolTip("Contents of the model's .txt file (parameters, training data, validation).")
+        filterLayout.addRow("Model info:", self.filterInfoBox)
+
+        self.filterTargetSelector = qt.QComboBox()
+        self.filterTargetSelector.addItem("SPECT/PET", FILTER_TARGET_PET)
+        self.filterTargetSelector.addItem("CT/MRI", FILTER_TARGET_CT)
+        self.filterTargetSelector.setToolTip(
+            "Volume the filter is applied to. Set automatically from the model's .txt file ('modality: CT') or its\n"
+            "file name (a CT / MR model such as CT_superres24.pth); change it if the guess is wrong.")
+        filterLayout.addRow("Apply to:", self.filterTargetSelector)
+
+        self.filterLimitToRoiCheckBox = qt.QCheckBox("Limit to ROI (crop before filtering)")
+        self.filterLimitToRoiCheckBox.setToolTip(
+            "Places an adjustable box (Slicer's Crop Volume ROI). Only the voxels inside it are filtered, which is\n"
+            "much faster and needs far less memory. The original volume is never cropped or changed.\n"
+            "The box is removed after filtering.")
+        filterLayout.addRow(self.filterLimitToRoiCheckBox)
+
+        self.filterForceCpuCheckBox = qt.QCheckBox("Force CPU")
+        self.filterForceCpuCheckBox.setToolTip(
+            f"Run on the CPU even when a GPU with at least {FILTER_MIN_VRAM_GB:g} GB of memory is available.")
+        filterLayout.addRow(self.filterForceCpuCheckBox)
+
+        self.applyFilterButton = qt.QPushButton("Apply Filter")
+        self.applyFilterButton.setToolTip(
+            "Creates a NEW filtered volume; the original volume is not changed.\n"
+            "The views, the MIP and the SUV ROIs then switch to the filtered volume.")
+        filterLayout.addRow(self.applyFilterButton)
+
+        self.filterStatusLabel = qt.QLabel("")
+        self.filterStatusLabel.wordWrap = True
+        filterLayout.addRow(self.filterStatusLabel)
+
+        self.filterModelFolderButton.connect("clicked()", self.onBrowseFilterModelFolder)
+        self.filterModelSelector.connect("currentIndexChanged(int)", self.onFilterModelChanged)
+        self.applyFilterButton.connect("clicked()", self.onApplyFilter)
+        self.filterLimitToRoiCheckBox.connect("toggled(bool)", self.onFilterLimitToRoiToggled)
+        self.restoreFilterModelFolder()
+
     def enter(self):
         self.observeThreeDViewNode()
         self.onLayoutChanged()
+        self.syncSlicerAnnotationsButton()
+        if hasattr(self, "filterModelSelector") and not self._filterRunning:
+            self.refreshFilterModels()  # models may have been added to the folder in the meantime
 
     def cleanup(self):
         try:
             self.mipOverlay.clear()
         except Exception:
             logging.exception("EasyFusion: could not remove the MIP overlay")
+        try:
+            self.windowInfoOverlay.enabled = False
+            self.windowInfoOverlay.clear()
+        except Exception:
+            logging.exception("EasyFusion: could not remove the slice view window info")
         if hasattr(self, "roiUpdateTimer"):
             self.roiUpdateTimer.stop()
+        if hasattr(self, "inputUpdateTimer"):
+            self.inputUpdateTimer.stop()
+        try:
+            self.removeFilterCropRoi()
+        except Exception:
+            logging.exception("EasyFusion: could not remove the filter crop ROI")
         # Otherwise a module reload leaves duplicate shortcuts, and Qt fires neither of two identical ones
         for shortcut in self._shortcuts:
             shortcut.setEnabled(False)
@@ -1023,6 +1878,9 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onSceneEndClose(self, caller=None, event=None):
         self.mipOverlay.clear()
+        self.windowInfoOverlay.scheduleUpdate()  # views are emptied: their text follows
+        self.filterCropRoiNode = None
+        self._setLimitToRoiChecked(False)
         self.setRoiNode(None)
         self.setHandlesNode(None)
         self.fillRoiTable([])
@@ -1030,9 +1888,13 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onSceneLoaded(self):
         """Called by the post-load chain (see _afterSceneLoad), after the scene repairs."""
-        self.restoreFromSettings()
-        self.connectToExistingRois()
+        with self.selectorsSetByPanel():
+            self.restoreFromSettings()
+            self.connectToExistingRois()
         self.refreshViewsAfterSceneChange()
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is not None and layoutManager.layout in DUAL_MONITOR_LAYOUT_IDS:
+            self.scheduleMIPRefit(layoutManager.layout)  # the Monitor 2 window is resized after the load
 
     def refreshViewsAfterSceneChange(self):
         self.observeThreeDViewNode()
@@ -1042,12 +1904,107 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onNodeAboutToBeRemoved(self, caller, event, node):
         if node is None:
             return
+        if node in (self.inputVolumeSelector.currentNode(), self.inputVolumeSelectorCT.currentNode()):
+            # The selector jumps to another volume on removal: that is not a choice of the user, so the
+            # views are not updated to it. Released once the removal (and the selector's reaction) is done.
+            self._suppressInputUpdate += 1
+            qt.QTimer.singleShot(0, self._releaseInputUpdate)
         if self.roiNode is not None and node.GetID() == self.roiNode.GetID():
             self.setRoiNode(None)
             self.scheduleRoiUpdate()  # removes spheres and handles outside of this scene callback
         elif self.handlesNode is not None and node.GetID() == self.handlesNode.GetID():
             self.setHandlesNode(None)
             self.scheduleRoiUpdate()  # handles get recreated
+        elif self.filterCropRoiNode is not None and node.GetID() == self.filterCropRoiNode.GetID():
+            # The crop box was deleted elsewhere (e.g. Data module): "Limit to ROI" follows
+            self.filterCropRoiNode = None
+            self._setLimitToRoiChecked(False)
+
+    # ------------------------------------------------------------------
+    # Changing the input volumes after "Go"
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def selectorsSetByPanel(self):
+        """Selector changes made by the panel itself (scene load, filters) do not trigger a view update."""
+        self._suppressInputUpdate += 1
+        try:
+            yield
+        finally:
+            self._suppressInputUpdate -= 1
+
+    def _releaseInputUpdate(self):
+        self._suppressInputUpdate = max(0, self._suppressInputUpdate - 1)
+
+    def onInputVolumeSelectionChanged(self, node=None):
+        self.windowInfoOverlay.scheduleUpdate()  # the CT / PET labels follow the selectors
+        if self._suppressInputUpdate or sceneIsBusy():
+            return
+        self.inputUpdateTimer.start()  # (re)started: a PET and a CT change in a row give one update
+
+    def applyChangedInputVolumes(self):
+        """
+        Once the views have been built with "Go", show a newly selected SPECT/PET or CT/MRI in them right away.
+        Slice positions, pan and zoom, the 3D camera and the fusion opacity stay as they are.
+        """
+        if sceneIsBusy() or self._filterRunning:
+            return
+        settingsNode = self.logic.getSettingsNode(create=False)
+        if settingsNode is None:
+            return  # "Go" has not been pressed in this scene yet
+        oldPet = settingsNode.GetNodeReference(SETTINGS_PET_ROLE)
+        oldCt = settingsNode.GetNodeReference(SETTINGS_CT_ROLE)
+        pet = self.inputVolumeSelector.currentNode()
+        ct = self.inputVolumeSelectorCT.currentNode()
+        if pet is None or ct is None or (pet is oldPet and ct is oldCt):
+            return
+        if pet is ct:
+            return  # e.g. a newly loaded volume selected in both boxes: wait for the user to pick the other one
+        try:
+            self.updateFusionVolumes(oldPet, oldCt, pet, ct)
+        except Exception:
+            logging.exception("EasyFusion: could not update the views to the new volumes")
+            return
+        slicer.util.showStatusMessage(f"EasyFusion: showing {pet.GetName()} on {ct.GetName()}", 3000)
+
+    def updateFusionVolumes(self, oldPet, oldCt, pet, ct):
+        """Like "Go", but without touching slice positions, zoom or the 3D camera."""
+        for node in (pet, ct):
+            if node.GetDisplayNode() is None:
+                node.CreateDefaultDisplayNodes()
+        opacities = self.logic.foregroundOpacities(oldPet)  # keep the user's fusion opacity
+
+        if pet is not oldPet:
+            if oldPet is not None and oldPet.GetDisplayNode() is not None:
+                # Same color map and window as before (switch e.g. original <-> filtered, or another time point)
+                self.logic.copyScalarDisplaySettings(oldPet, pet)
+            else:
+                displayNode = pet.GetDisplayNode()
+                displayNode.SetAutoWindowLevel(False)
+                displayNode.SetWindow(10)
+                displayNode.SetLevel(5)
+                displayNode.SetInterpolate(True)
+                colorNodeName = FUSION_COLOR_MAPS.get(self.petColorMapSelector.currentText)
+                if colorNodeName is not None:
+                    self.setPETColorMap(colorNodeName)
+            if oldPet is None or not self.logic.moveMipToVolume(oldPet, pet):
+                if oldPet is None:  # no MIP to move: show one, as "Go" does (a MIP the user hid stays hidden)
+                    displayNode = pet.GetDisplayNode()
+                    self.logic.showOnlyThisVolumeRendering(pet)
+                    vrDisplayNode = slicer.modules.volumerendering.logic().CreateDefaultVolumeRenderingNodes(pet)
+                    vrDisplayNode.SetVisibility(True)
+                    self.logic.setMIPRange(vrDisplayNode, displayNode.GetLevel() - displayNode.GetWindow() / 2.0,
+                                           displayNode.GetLevel() + displayNode.GetWindow() / 2.0, flatOpacity=True)
+                    self.logic.showMipOnlyInMipView(vrDisplayNode)
+
+        if ct is not oldCt:
+            # Window left to the volume itself (Slicer's auto window for a new one); presets set it afterwards
+            ct.GetDisplayNode().SetAndObserveColorNodeID(slicer.util.getNode("Grey").GetID())
+
+        self.logic.rememberVolumes(pet, ct)
+        self.logic.applyViewRoles(pet, ct)  # composite nodes only: no fit, no orientation change
+        self.logic.restoreForegroundOpacities(opacities)
+        self.scheduleRoiUpdate()
 
     def onPETVolumeChanged(self, node=None):
         self.scheduleRoiUpdate()
@@ -1082,12 +2039,13 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         mipDisplayNode = slicer.modules.volumerendering.logic().CreateDefaultVolumeRenderingNodes(petNode)
         mipDisplayNode.SetVisibility(True)
         self.logic.setMIPRange(mipDisplayNode, 0.0, 10.0, flatOpacity=True)
+        # Rendered in the EasyFusion 3D view only, and that same view node is switched to MIP
+        viewNode = self.logic.showMipOnlyInMipView(mipDisplayNode)
 
         threeDWidget = self.getThreeDWidget()
-        if threeDWidget is not None:
-            viewNode = threeDWidget.mrmlViewNode()
+        if viewNode is not None:
             wasModifying = viewNode.StartModify()
-            viewNode.SetRaycastTechnique(2)   # MIP
+            viewNode.SetRaycastTechnique(MIP_RAYCAST_TECHNIQUE)
             viewNode.SetRenderMode(1)         # orthographic
             viewNode.SetBoxVisible(0)
             viewNode.SetAxisLabelsVisible(0)
@@ -1100,10 +2058,14 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             viewNode.EndModify(wasModifying)
             self.observeThreeDViewNode()
 
+        if threeDWidget is not None:
             threeDView = threeDWidget.threeDView()
             threeDView.resetFocalPoint()
             threeDView.rotateToViewAxis(3)
             self.fitMIPToView(petNode)
+            # The first time, Slicer applies the orthographic switch and the new layout size only after this
+            # function returns, which replaces the zoom above; fit again once everything has settled.
+            qt.QTimer.singleShot(MIP_FIT_DELAY_MS, lambda: self.fitMIPToView(petNode))
 
         ctNode.GetDisplayNode().SetAndObserveColorNodeID(slicer.util.getNode("Grey").GetID())
         colorNodeName = FUSION_COLOR_MAPS.get(self.petColorMapSelector.currentText)
@@ -1126,6 +2088,8 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if layoutManager is None:
             return
         self.logic.ensureLayoutsRegistered()
+        if layoutManager.layout == layoutID:
+            self.scheduleMIPRefit(layoutID)  # same layout clicked again: no layoutChanged signal, refit anyway
         layoutManager.setLayout(layoutID)
 
         pet = self.inputVolumeSelector.currentNode()
@@ -1139,7 +2103,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.afterViewRolesApplied(changedViews)
 
         if layoutID in DUAL_MONITOR_LAYOUT_IDS:
-            qt.QTimer.singleShot(300, self.logic.placeSecondaryViewportWindow)
+            qt.QTimer.singleShot(DUAL_MONITOR_PLACE_DELAY_MS, self.logic.placeSecondaryViewportWindow)
         self.onLayoutChanged()
 
     def afterViewRolesApplied(self, changedViews):
@@ -1161,6 +2125,28 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.layoutButtonGroup.setExclusive(True)
         # A layout switch can create new 3D views (or move them to the Monitor 2 window): re-attach the MIP overlay
         self.scheduleRoiUpdate()
+        # ... and new slice views: give them their window info
+        self.windowInfoOverlay.scheduleUpdate()
+        if layoutID is not None:  # a real layout switch (the signal), not a refresh on module enter / scene load
+            self.scheduleMIPRefit(current)
+
+    def scheduleMIPRefit(self, layoutID=None):
+        """Fit the MIP again once the new layout has its final size (Monitor 2 window placed after 300 ms)."""
+        qt.QTimer.singleShot(MIP_FIT_DELAY_MS, self.refitMIP)
+        if layoutID in DUAL_MONITOR_LAYOUT_IDS:
+            qt.QTimer.singleShot(MIP_FIT_DELAY_MS + 400, self.refitMIP)
+
+    def refitMIP(self):
+        """Re-fit only when the MIP of the selected PET is shown; otherwise leave the 3D camera alone."""
+        if sceneIsBusy():
+            return
+        pet = self.inputVolumeSelector.currentNode()
+        if pet is None or not slicer.mrmlScene.IsNodePresent(pet):
+            return
+        displayNode = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(pet)
+        if displayNode is None or not displayNode.GetVisibility():
+            return
+        self.fitMIPToView(pet)
 
     def restoreFromSettings(self):
         settingsNode = self.logic.getSettingsNode(create=False)
@@ -1215,8 +2201,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onThresholdModeChanged(self, index=None):
         mode, _ = self.currentThreshold()
         self._applyThresholdModeToSpinBox(mode)
-        self.saveThresholdSettings()
-        self.scheduleRoiUpdate()
+        self.applyThresholdControls()
 
     def onThresholdValueChanged(self, value):
         mode, _ = self.currentThreshold()
@@ -1224,8 +2209,43 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._absoluteThreshold = float(value)
         else:
             self._relativeThreshold = float(value)
+        self.applyThresholdControls()
+
+    def applyThresholdControls(self):
+        """
+        A threshold change goes to the ROI selected in the table only. What the controls show is also saved as
+        the threshold for new ROIs. With no ROI selected, existing ROIs keep their own thresholds.
+        """
         self.saveThresholdSettings()
-        self.scheduleRoiUpdate()
+        node = self.roiNode
+        pointID = self.selectedRoiPointID()
+        if node is not None and pointID is not None:
+            self.logic.setRoiThreshold(node, pointID, *self.currentThreshold())
+            self.scheduleRoiUpdate()
+
+    def setThresholdControls(self, mode, value):
+        """Show a threshold in the controls without applying it to anything (e.g. the selected ROI's own)."""
+        mode = mode if mode in (THRESHOLD_RELATIVE, THRESHOLD_ABSOLUTE) else THRESHOLD_RELATIVE
+        if mode == THRESHOLD_ABSOLUTE:
+            self._absoluteThreshold = float(value)
+        else:
+            self._relativeThreshold = float(value)
+        wasBlocked = self.thresholdModeComboBox.blockSignals(True)
+        self.thresholdModeComboBox.setCurrentIndex(self.thresholdModeComboBox.findData(mode))
+        self.thresholdModeComboBox.blockSignals(wasBlocked)
+        self._applyThresholdModeToSpinBox(mode)
+        self.saveThresholdSettings()  # the controls' values are what new ROIs get
+
+    def syncThresholdControls(self, rows, selectedID):
+        """After a programmatic selection (new or dragged ROI), show that ROI's threshold in the controls."""
+        if selectedID is None:
+            return
+        for pointID, _, _, _, (mode, value), _ in rows:
+            if pointID == selectedID:
+                currentMode, currentValue = self.currentThreshold()
+                if mode != currentMode or abs(value - currentValue) > 1e-6:
+                    self.setThresholdControls(mode, value)
+                return
 
     def saveThresholdSettings(self):
         settingsNode = self.logic.getSettingsNode()
@@ -1258,24 +2278,30 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # ------------------------------------------------------------------
 
     def fitMIPToView(self, volumeNode):
+        """Center the MIP on the volume and zoom so the 3D view shows MIP_FIT_HEIGHT_MM from top to bottom."""
         threeDWidget = self.getThreeDWidget()
-        if threeDWidget is None or volumeNode is None:
+        if threeDWidget is None or volumeNode is None or not slicer.mrmlScene.IsNodePresent(volumeNode):
             return
+        threeDView = threeDWidget.threeDView()
+        threeDView.forceRender()  # applies pending view node changes (orthographic mode) before the fit
         bounds = [0.0] * 6
         volumeNode.GetRASBounds(bounds)
-        height = bounds[5] - bounds[4]
-        if height <= 0:
-            return
-        renderer = threeDWidget.threeDView().renderWindow().GetRenderers().GetFirstRenderer()
-        renderer.GetActiveCamera().SetParallelScale(height * 0.6)  # Zoom fit
-        threeDWidget.threeDView().forceRender()
+        if bounds[1] < bounds[0]:
+            return  # empty volume
+        renderer = threeDView.renderWindow().GetRenderers().GetFirstRenderer()
+        camera = renderer.GetActiveCamera()
+        # Move the camera sideways to the volume center, keeping the viewing direction and distance
+        center = [(bounds[0] + bounds[1]) / 2.0, (bounds[2] + bounds[3]) / 2.0, (bounds[4] + bounds[5]) / 2.0]
+        focalPoint, position = camera.GetFocalPoint(), camera.GetPosition()
+        camera.SetFocalPoint(*center)
+        camera.SetPosition(*[p + c - f for p, c, f in zip(position, center, focalPoint)])
+        camera.SetParallelScale(MIP_FIT_HEIGHT_MM / 2.0)  # parallel scale = half of the visible height
+        renderer.ResetCameraClippingRange()
+        threeDView.forceRender()
 
     @staticmethod
     def getThreeDWidget():
-        layoutManager = slicer.app.layoutManager()
-        if layoutManager is None or layoutManager.threeDViewCount < 1:
-            return None
-        return layoutManager.threeDWidget(0)
+        return Easy_fusionLogic.mipThreeDWidget()
 
     def observeThreeDViewNode(self, updateButton=True):
         """Keep observing the view node of the first 3D view (it can change with layout or scene)."""
@@ -1357,6 +2383,11 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if preset is None:
             return
         kind, text, window, level = preset
+        if kind == "ct" and not self.ctMriLooksLikeCT():
+            mriPreset = next((p for p in MRI_PERCENTILE_PRESETS if p[3] == key), None)
+            if mriPreset is not None:
+                self.setMRIWindowPercentile(mriPreset[1], mriPreset[2], mriPreset[0])
+            return
         if kind == "ct":
             self.setCTWindow(window, level)
             slicer.util.showStatusMessage(f"EasyFusion: {text}", 2000)
@@ -1375,6 +2406,45 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.util.showStatusMessage("EasyFusion: the SPECT/PET volume has no positive counts.", 3000)
             return
         self.setPETWindow(upper, upper / 2.0)
+
+    def mriTissueSample(self, volumeNode):
+        """Sampled tissue intensities of the CT/MRI volume (cached until the volume or its voxels change)."""
+        imageData = volumeNode.GetImageData() if volumeNode is not None else None
+        if imageData is None or imageData.GetNumberOfPoints() == 0:
+            return None
+        key = (volumeNode.GetID(), imageData.GetMTime())
+        if self._mriSample[0] == key:
+            return self._mriSample[1]
+        voxels = slicer.util.arrayFromVolume(volumeNode)
+        if voxels.ndim > 3:
+            voxels = voxels[..., 0]
+        step = max(1, int(math.ceil((voxels.size / float(MRI_PRESET_SAMPLE_SIZE)) ** (1.0 / 3.0))))
+        sample = tissueSample(voxels[::step, ::step, ::step])
+        self._mriSample = (key, sample)
+        return sample
+
+    def setMRIWindowPercentile(self, lowerPercentile, upperPercentile, text=""):
+        """MRI presets: window between two percentiles of the tissue intensities of the CT/MRI volume."""
+        volumeNode = self.inputVolumeSelectorCT.currentNode()
+        if volumeNode is None or volumeNode.GetImageData() is None:
+            slicer.util.showStatusMessage("EasyFusion: select a CT/MRI volume first.", 3000)
+            return
+        sample = self.mriTissueSample(volumeNode)
+        windowLevel = percentileWindow(sample, lowerPercentile, upperPercentile) if sample is not None else None
+        if windowLevel is None:
+            slicer.util.showStatusMessage("EasyFusion: the CT/MRI volume has no intensity range.", 3000)
+            return
+        self.setCTWindow(*windowLevel)
+        label = f"{text} " if text else ""
+        slicer.util.showStatusMessage(
+            f"EasyFusion: MRI {label}(percentile {lowerPercentile:g}–{upperPercentile:g})", 2000)
+
+    def ctMriLooksLikeCT(self):
+        volumeNode = self.inputVolumeSelectorCT.currentNode()
+        imageData = volumeNode.GetImageData() if volumeNode is not None else None
+        if imageData is None or imageData.GetNumberOfPoints() == 0:
+            return True  # nothing to decide on: keep the CT presets
+        return looksLikeCT(imageData.GetScalarRange()[0])
 
     def setPETColorMap(self, colorNodeName):
         petNode = self.inputVolumeSelector.currentNode()
@@ -1503,7 +2573,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.setRoiNode(node)
 
         pet = self.inputVolumeSelector.currentNode()
-        self.roiPetLabel.text = f"Measuring on: {pet.GetName()}" if pet else "Measuring on: (no PET selected)"
+        self.updateMeasuringLabel(pet)
 
         if node is None:
             self.logic.removeRoiSphereModel()
@@ -1515,7 +2585,8 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.mipOverlay.clear()
             return
 
-        thresholdMode, thresholdValue = self.currentThreshold()
+        defaultThreshold = self.currentThreshold()  # given to ROIs that have none yet (new / older scenes)
+        labelFields = self.roiLabelFields()
         selectedID = self.selectedRoiPointID()
         rows, spheres, newCache = [], [], {}
         labelEntries, segmentEntries, mipEntries = [], [], []
@@ -1534,19 +2605,22 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # May change radii (handle dragged), so it runs before statistics
             draggedRoiID = self.syncRadiusHandles(node, rois)
+            self._roiCenters = {pointID: tuple(center) for _, pointID, center in rois}
 
             for index, pointID, center in rois:
                 radius = self.logic.getRoiRadius(node, pointID, self.roiRadiusSpinBox.value)
                 number = self.logic.getRoiNumber(node, pointID)
                 color = self.logic.getRoiColor(node, pointID)
                 roiColors[pointID] = color
+                threshold = self.logic.getRoiThreshold(node, pointID, defaultThreshold)
+                origin = self.logic.getRoiOrigin(node, pointID)
 
-                key = self.logic.statsCacheKey(pet, center, radius, thresholdMode, thresholdValue)
+                key = self.logic.statsCacheKey(pet, center, radius, *threshold)
                 unchanged = key in self._roiStatsCache
                 if unchanged:
                     stats = self._roiStatsCache[key]
                 else:
-                    stats = self.logic.computeSphereStatistics(pet, center, radius, thresholdMode, thresholdValue)
+                    stats = self.logic.computeSphereStatistics(pet, center, radius, *threshold)
                 newCache[key] = stats
 
                 name = f"ROI-{number}"
@@ -1555,10 +2629,12 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 if node.GetNthControlPointLabel(index) != name:
                     node.SetNthControlPointLabel(index, name)
 
-                rows.append((pointID, name, radius, stats))
+                rows.append((pointID, name, radius, stats, threshold, origin))
                 spheres.append((center, radius, color))
-                labelEntries.append((pointID, center, radius, formatRoiLabel(name, stats, pet is not None)))
-                mipEntries.append((pointID, center, formatRoiLabel(name, stats, pet is not None), color))
+                labelText = formatRoiLabel(name, stats, pet is not None, labelFields, radius, threshold)
+                if labelText:  # nothing chosen under "Show near ROI": no label at all
+                    labelEntries.append((pointID, center, radius, labelText))
+                mipEntries.append((pointID, center, labelText, color))
                 segmentEntries.append((pointID, name, stats, unchanged, color))
 
             if pet is not None and rows and node.GetNodeReferenceID(ROI_PET_REFERENCE_ROLE) != pet.GetID():
@@ -1591,6 +2667,8 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             logging.exception("EasyFusion: could not update the MIP overlay")
         self.fillRoiTable(rows, selectedID, roiColors)
         self.syncRadiusSpinBox(rows, selectedID)
+        self.syncThresholdControls(rows, selectedID)
+        self.updateRoiEditTarget()
         if newRoiCenter is not None:
             self.jumpSliceViewsTo(newRoiCenter)
 
@@ -1696,7 +2774,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def syncRadiusSpinBox(self, rows, selectedID):
         if selectedID is None:
             return
-        for pointID, _, radius, _ in rows:
+        for pointID, _, radius, *_ in rows:
             if pointID == selectedID:
                 if abs(self.roiRadiusSpinBox.value - radius) > 1e-6:
                     wasBlocked = self.roiRadiusSpinBox.blockSignals(True)
@@ -1708,15 +2786,21 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not hasattr(self, "roiTable"):
             return
         table = self.roiTable
+        self._roiTableRows = list(rows)
+        if not rows:
+            self._roiCenters = {}
+        if hasattr(self, "exportRoiTableButton"):
+            self.exportRoiTableButton.enabled = bool(rows)
         wasBlocked = table.blockSignals(True)
         try:
             table.setRowCount(len(rows))
-            for rowIndex, (pointID, name, radius, stats) in enumerate(rows):
-                values = formatRoiTableRow(name, radius, stats)
+            for rowIndex, (pointID, name, radius, stats, threshold, origin) in enumerate(rows):
+                values = formatRoiTableRow(name, radius, stats, threshold)
                 for column, text in enumerate(values):
                     item = qt.QTableWidgetItem(text)
                     if column == 0:
                         item.setData(qt.Qt.UserRole, pointID)
+                        item.setToolTip("Placed by AI" if origin == ROI_ORIGIN_AI else "Placed by the user")
                         color = (colors or {}).get(pointID)
                         if color is not None:  # color swatch next to the ROI name
                             item.setData(qt.Qt.DecorationRole,
@@ -1741,6 +2825,7 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return item.data(qt.Qt.UserRole) if item is not None else None
 
     def onRoiSelectionChanged(self):
+        self.updateRoiEditTarget()
         node = self.roiNode
         pointID = self.selectedRoiPointID()
         if node is None or pointID is None:
@@ -1749,9 +2834,36 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         wasBlocked = self.roiRadiusSpinBox.blockSignals(True)
         self.roiRadiusSpinBox.setValue(radius)
         self.roiRadiusSpinBox.blockSignals(wasBlocked)
+        # The ROI's own threshold is loaded into the controls (they now edit this ROI only)
+        self.setThresholdControls(*self.logic.getRoiThreshold(node, pointID, self.currentThreshold()))
         index = node.GetNthControlPointIndexByID(pointID)
         if index >= 0:
             slicer.modules.markups.logic().JumpSlicesToNthPointInMarkup(node.GetID(), index, True)
+
+    def onDeselectRoi(self):
+        self.roiTable.clearSelection()  # -> onRoiSelectionChanged: the controls now set values for new ROIs
+
+    def updateRoiEditTarget(self):
+        """Tell which ROI the radius / threshold controls edit: the selected one, or new ROIs."""
+        if not hasattr(self, "roiEditTargetLabel"):
+            return
+        selectedRows = self.roiTable.selectionModel().selectedRows()
+        item = self.roiTable.item(selectedRows[0].row(), 0) if selectedRows else None
+        if item is not None:
+            self.roiEditTargetLabel.text = f"Radius and threshold: editing {item.text()} only"
+            self.roiDeselectButton.enabled = True
+        else:
+            self.roiEditTargetLabel.text = "Radius and threshold: values for new ROIs"
+            self.roiDeselectButton.enabled = False
+
+    def roiLabelFields(self):
+        if not hasattr(self, "roiLabelFieldCheckBoxes"):
+            return tuple(DEFAULT_ROI_LABEL_FIELDS)
+        return tuple(key for key, _ in ROI_LABEL_FIELDS if self.roiLabelFieldCheckBoxes[key].checked)
+
+    def onRoiLabelFieldsChanged(self, checked=None):
+        qt.QSettings().setValue(SETTINGS_ROI_LABEL_FIELDS, ",".join(self.roiLabelFields()))
+        self.scheduleRoiUpdate()
 
     def onRoiRadiusChanged(self, value):
         node = self.roiNode
@@ -1833,10 +2945,680 @@ class Easy_fusionWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic.forgetAllRois(node)
         self.scheduleRoiUpdate()
 
+    def onExportRoiTable(self):
+        """Write the ROI table to a .tsv file chosen by the user."""
+        # A pending recomputation (e.g. right after a drag) would make the file lag behind the views
+        if self.roiUpdateTimer.isActive():
+            self.roiUpdateTimer.stop()
+            self.updateRois()
+        rows = list(self._roiTableRows)
+        if not rows:
+            slicer.util.infoDisplay("There are no ROIs to export.", windowTitle="Export ROI table")
+            return
+
+        pet = self.inputVolumeSelector.currentNode()
+        petName = pet.GetName() if pet is not None else ""
+        petFilter = ""
+        if pet is not None and pet.GetAttribute(FILTER_MODEL_ATTRIBUTE):
+            petFilter = pet.GetAttribute(FILTER_MODEL_ATTRIBUTE)
+            if pet.GetAttribute(FILTER_CROPPED_ATTRIBUTE):
+                petFilter += " (ROI only)"
+
+        settings = qt.QSettings()
+        folder = settings.value(SETTINGS_ROI_EXPORT_FOLDER) or ""
+        if not os.path.isdir(folder):
+            folder = qt.QStandardPaths.writableLocation(qt.QStandardPaths.DocumentsLocation) or ""
+        path = qt.QFileDialog.getSaveFileName(
+            slicer.util.mainWindow(), "Export ROI table",
+            os.path.join(folder, defaultRoiExportFileName(petName)),
+            "Tab-separated values (*.tsv);;All files (*)")
+        if isinstance(path, (tuple, list)):  # some Qt bindings return (fileName, selectedFilter)
+            path = path[0] if path else ""
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".tsv"
+
+        text = formatRoiTableTsv(rows, self._roiCenters, petName, petFilter)
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as tsvFile:
+                tsvFile.write(text)
+        except OSError as error:
+            slicer.util.errorDisplay(f"Could not write the ROI table:\n{path}\n\n{error}",
+                                     windowTitle="Export ROI table")
+            return
+        settings.setValue(SETTINGS_ROI_EXPORT_FOLDER, os.path.dirname(path))
+        slicer.util.showStatusMessage(f"Exported {len(rows)} ROI(s) to {path}", 5000)
+        logging.info(f"EasyFusion: exported {len(rows)} ROI(s) to {path}")
+
+    def updateMeasuringLabel(self, pet):
+        """Which PET the ROIs measure on; a filtered volume gets a permanent reminder that its SUVs differ."""
+        label = self.roiPetLabel
+        if pet is None:
+            label.text, toolTip, style = "Measuring on: (no PET selected)", "", ""
+        elif pet.GetAttribute(FILTER_MODEL_ATTRIBUTE):
+            source = pet.GetNodeReference(FILTER_SOURCE_ROLE)
+            region = ", ROI only" if pet.GetAttribute(FILTER_CROPPED_ATTRIBUTE) else ""
+            label.text = (f"Measuring on: {pet.GetName()}\n"
+                          f"⚠ AI-filtered ({pet.GetAttribute(FILTER_MODEL_ATTRIBUTE)}{region}): "
+                          "SUVs differ from the original")
+            toolTip = f"Original volume: {source.GetName()}" if source is not None else ""
+            style = "color: #d9822b;"
+        else:
+            label.text, toolTip, style = f"Measuring on: {pet.GetName()}", "", ""
+        label.setToolTip(toolTip)
+        label.setStyleSheet(style)
+
+    # ------------------------------------------------------------------
+    # AI post-processing filters
+    # ------------------------------------------------------------------
+
+    def restoreFilterModelFolder(self):
+        """This module's last folder; otherwise the folder last used in the PETDenoise module."""
+        folder = qt.QSettings().value(SETTINGS_FILTER_MODEL_FOLDER) or ""
+        if not os.path.isdir(folder):
+            folder = self.filterLogic.petDenoiseModelFolder() or ""
+        self.filterModelFolderEdit.text = folder
+        self.refreshFilterModels()
+
+    def onBrowseFilterModelFolder(self):
+        folder = qt.QFileDialog.getExistingDirectory(
+            slicer.util.mainWindow(), "Select the model folder", self.filterModelFolderEdit.text or "")
+        if not folder:
+            return
+        self.filterModelFolderEdit.text = folder
+        qt.QSettings().setValue(SETTINGS_FILTER_MODEL_FOLDER, folder)
+        self.refreshFilterModels()
+
+    def refreshFilterModels(self):
+        folder = self.filterModelFolderEdit.text
+        previous = self.filterModelSelector.currentText
+        try:
+            models = sorted((name for name in os.listdir(folder) if name.lower().endswith(".pth")), key=str.lower)
+        except OSError:
+            models = []
+        existing = [self.filterModelSelector.itemText(i) for i in range(self.filterModelSelector.count)]
+        if models == existing and self._filterParams is not None:
+            return  # nothing new: keep the selection and a manually chosen "Apply to"
+        wasBlocked = self.filterModelSelector.blockSignals(True)
+        self.filterModelSelector.clear()
+        self.filterModelSelector.addItems(models)
+        if previous in models:
+            self.filterModelSelector.setCurrentIndex(models.index(previous))
+        self.filterModelSelector.blockSignals(wasBlocked)
+        self.onFilterModelChanged()
+
+    def onFilterModelChanged(self, index=None):
+        modelName = self.filterModelSelector.currentText
+        self.applyFilterButton.enabled = bool(modelName) and not self._filterRunning
+        if not modelName:
+            self._filterParams, self._filterNotes = None, {}
+            self.filterInfoBox.setPlainText(
+                "No .pth models in this folder." if self.filterModelFolderEdit.text else "Select a model folder.")
+            return
+        sidecarPath = os.path.join(self.filterModelFolderEdit.text, os.path.splitext(modelName)[0] + ".txt")
+        text = None
+        if os.path.isfile(sidecarPath):
+            try:
+                with open(sidecarPath, "r", encoding="utf-8-sig", errors="replace") as sidecar:
+                    text = sidecar.read()
+            except OSError:
+                logging.exception(f"EasyFusion: could not read {sidecarPath}")
+        self._filterParams, self._filterNotes = parseFilterMetadata(text)
+        if text is None:
+            self.filterInfoBox.setPlainText(
+                "No description file (.txt) found for this model. The default parameters of the PETDenoise "
+                "module are used, which may not match the model.")
+        else:
+            self.filterInfoBox.setPlainText(text.strip())
+        target = guessFilterTarget(modelName, self._filterParams)
+        self.filterTargetSelector.setCurrentIndex(self.filterTargetSelector.findData(target))
+
+    def currentFilterTarget(self):
+        target = self.filterTargetSelector.itemData(self.filterTargetSelector.currentIndex)
+        return target if target in (FILTER_TARGET_PET, FILTER_TARGET_CT) else FILTER_TARGET_PET
+
+    def _setLimitToRoiChecked(self, checked):
+        """Change the "Limit to ROI" box without creating / removing the crop ROI."""
+        if not hasattr(self, "filterLimitToRoiCheckBox"):
+            return
+        wasBlocked = self.filterLimitToRoiCheckBox.blockSignals(True)
+        self.filterLimitToRoiCheckBox.checked = checked
+        self.filterLimitToRoiCheckBox.blockSignals(wasBlocked)
+
+    def filterTargetVolume(self):
+        """(volume the filter applies to, its kind for messages), following "Apply to"."""
+        if self.currentFilterTarget() == FILTER_TARGET_PET:
+            return self.inputVolumeSelector.currentNode(), "SPECT/PET"
+        return self.inputVolumeSelectorCT.currentNode(), "CT/MRI"
+
+    def onFilterLimitToRoiToggled(self, checked):
+        if not checked:
+            self.removeFilterCropRoi()
+            if self.filterStatusLabel.text.startswith("Crop ROI placed"):
+                self.filterStatusLabel.text = ""
+            return
+        volumeNode, kind = self.filterTargetVolume()
+        if volumeNode is None or volumeNode.GetImageData() is None:
+            slicer.util.warningDisplay(f"Select a {kind} volume first: the crop ROI is fitted to it.")
+            self._setLimitToRoiChecked(False)
+            return
+        roiNode = self.filterCropRoiNode
+        if roiNode is None or not slicer.mrmlScene.IsNodePresent(roiNode):
+            self.removeFilterCropRoi()  # leftovers, e.g. from a module reload
+            try:
+                roiNode = self.filterLogic.createCropRoi(volumeNode)
+            except Exception:
+                logging.exception("EasyFusion: could not create the filter crop ROI")
+                self.removeFilterCropRoi()
+                roiNode = None
+        if roiNode is None:
+            slicer.util.errorDisplay("Could not create the crop ROI.")
+            self._setLimitToRoiChecked(False)
+            return
+        self.filterCropRoiNode = roiNode
+        self.filterStatusLabel.text = (
+            f"Crop ROI placed around '{volumeNode.GetName()}'. Drag the handles of the cyan box in the slice or 3D "
+            "views to the region you need, then press Apply Filter. Only that region is filtered; the original "
+            "volume is not changed.")
+
+    def removeFilterCropRoi(self):
+        self.filterCropRoiNode = None  # first, so the node-removal observer has nothing left to react to
+        for node in self.filterLogic.findCropRois() if self.filterLogic is not None else []:
+            slicer.mrmlScene.RemoveNode(node)
+
+    def resetFilterCropRoi(self):
+        """After a successful run: remove the box and untick "Limit to ROI"."""
+        self._setLimitToRoiChecked(False)
+        self.removeFilterCropRoi()
+
+    def onApplyFilter(self):
+        if self._filterRunning:
+            return
+        modelName = self.filterModelSelector.currentText
+        modelPath = os.path.join(self.filterModelFolderEdit.text, modelName) if modelName else ""
+        if not modelName or not os.path.isfile(modelPath):
+            slicer.util.warningDisplay("Select a model folder and a model (.pth) first.")
+            return
+        params = self._filterParams or dict(FILTER_DEFAULT_PARAMETERS)
+        target = self.currentFilterTarget()
+        petNode = self.inputVolumeSelector.currentNode()
+        ctNode = self.inputVolumeSelectorCT.currentNode()
+        if target == FILTER_TARGET_PET:
+            sourceNode, otherNode, sourceKind, otherKind = petNode, ctNode, "SPECT/PET", "CT/MRI"
+        else:
+            sourceNode, otherNode, sourceKind, otherKind = ctNode, petNode, "CT/MRI", "SPECT/PET"
+        if sourceNode is None or sourceNode.GetImageData() is None:
+            slicer.util.warningDisplay(f"Select a {sourceKind} volume first.")
+            return
+
+        secondNode = None
+        if params["dual_channel"]:
+            if otherNode is None or otherNode.GetImageData() is None:
+                slicer.util.warningDisplay(
+                    f"{modelName} is a dual-channel model: select the {otherKind} volume too (second input).")
+                return
+            if otherNode.GetTransformNodeID() != sourceNode.GetTransformNodeID():
+                slicer.util.warningDisplay(
+                    "Dual-channel models need both volumes under the same transform. "
+                    "Harden the registration transform (Data module) first.")
+                return
+            secondNode = otherNode
+
+        roiNode = None
+        if self.filterLimitToRoiCheckBox.checked:
+            roiNode = self.filterCropRoiNode
+            if roiNode is None or not slicer.mrmlScene.IsNodePresent(roiNode):
+                self.resetFilterCropRoi()
+                slicer.util.warningDisplay("The crop ROI no longer exists. Tick 'Limit to ROI' again to place a new one.")
+                return
+
+        croppedNode = None
+        try:
+            # With "Limit to ROI" the filter reads Crop Volume's output. It is removed on every path below
+            # (dialog cancelled, progress cancelled, failure, success); the original volume stays whole.
+            inputNode = sourceNode
+            if roiNode is not None:
+                try:
+                    croppedNode = self.filterLogic.cropToRoi(sourceNode, roiNode)
+                except Exception as error:
+                    logging.exception("EasyFusion: cropping to the filter ROI failed")
+                    slicer.util.errorDisplay(f"Cropping to the ROI failed:\n{error}",
+                                             detailedText=traceback.format_exc())
+                    return
+                if croppedNode is None or croppedNode.GetImageData() is None:
+                    slicer.util.errorDisplay("Crop Volume did not produce a cropped volume.")
+                    return
+                inputNode = croppedNode
+
+            suffix = "_crop" if croppedNode is not None else ""
+            outputName = self.filterLogic.uniqueVolumeName(
+                f"{sourceNode.GetName()}_{os.path.splitext(modelName)[0]}{suffix}")
+            decision = self.confirmFilter(sourceNode, inputNode, secondNode, modelName, params, target, outputName)
+            if decision == "crop":
+                self.filterLimitToRoiCheckBox.checked = True  # places the adjustable box (onFilterLimitToRoiToggled)
+                return
+            if decision != "apply" or not self._prepareFilterDependencies():
+                return
+
+            result = self._runFilterWithProgress(inputNode, secondNode, modelPath, params, outputName, sourceNode)
+            if result is None:
+                if roiNode is not None:
+                    self.filterStatusLabel.text += " The crop ROI is kept so you can adjust it and try again."
+                return
+            outputNode, deviceText, seconds = result
+        finally:
+            if croppedNode is not None and slicer.mrmlScene.IsNodePresent(croppedNode):
+                slicer.mrmlScene.RemoveNode(croppedNode)
+
+        if roiNode is not None:
+            self.resetFilterCropRoi()  # the box has done its job
+        try:
+            self.showFilteredVolume(sourceNode, outputNode, otherNode, target)
+        except Exception:
+            logging.exception("EasyFusion: could not switch the views to the filtered volume")
+            slicer.util.warningDisplay(
+                f"'{outputNode.GetName()}' was created but could not be shown automatically. "
+                f"Select it as {sourceKind} and press Go.")
+        followers = "views, MIP and SUV ROIs now use it" if target == FILTER_TARGET_PET else "views now use it"
+        region = " (ROI region only)" if roiNode is not None else ""
+        message = (f"Created '{outputNode.GetName()}'{region} in {seconds:.0f} s ({deviceText}). The {followers}; "
+                   f"'{sourceNode.GetName()}' is unchanged.")
+        self.filterStatusLabel.text = message
+        slicer.util.showStatusMessage(f"EasyFusion: {message}", 6000)
+        logging.info(f"EasyFusion: {message} Model: {modelPath}")
+
+    def _prepareFilterDependencies(self):
+        try:
+            return self.ensureFilterDependencies()
+        except Exception as error:
+            logging.exception("EasyFusion: could not prepare the AI filter dependencies")
+            slicer.util.errorDisplay(f"Could not install the AI filter dependencies:\n{error}",
+                                     detailedText=traceback.format_exc())
+            return False
+
+    def _runFilterWithProgress(self, inputNode, secondNode, modelPath, params, outputName, sourceNode):
+        """Filter behind a modal, cancellable progress dialog. (outputNode, device, seconds), or None if not done."""
+        self._filterRunning = True
+        self.applyFilterButton.enabled = False
+        self.filterStatusLabel.text = ""
+        progress = FilterProgressDialog(f"EasyFusion - {os.path.basename(modelPath)}")
+        try:
+            return self.filterLogic.run(inputNode, secondNode, modelPath, params, outputName,
+                                        forceCPU=self.filterForceCpuCheckBox.checked, report=progress,
+                                        originalNode=sourceNode)
+        except FilterCancelled:
+            self.filterStatusLabel.text = "Cancelled. Nothing was added; the original volume is unchanged."
+        except Exception as error:
+            logging.exception("EasyFusion: AI filter failed")
+            self.filterStatusLabel.text = "Filtering failed. Nothing was added; the original volume is unchanged."
+            slicer.util.errorDisplay(f"Filtering with {os.path.basename(modelPath)} failed:\n{error}",
+                                     detailedText=traceback.format_exc())
+        finally:
+            progress.close()
+            self._filterRunning = False
+            self.applyFilterButton.enabled = True
+        return None
+
+    def confirmFilter(self, sourceNode, inputNode, secondNode, modelName, params, target, outputName):
+        """
+        Warn about what the filter changes (SUVs above all) and about large runs, before anything is computed.
+        inputNode: what will be filtered (sourceNode, or its cropped copy with "Limit to ROI").
+        Returns "apply", "crop" (the user wants to crop first) or None (cancelled).
+        """
+        esc = html.escape
+        sourceName = sourceNode.GetName()
+        cropped = inputNode is not sourceNode
+        spacingText = " × ".join(f"{v:g}" for v in sourceNode.GetSpacing())
+        targetSpacing = None if params["dont_resample"] else params["voxel_spacing"]
+        job = filterJobSize(inputNode.GetImageData().GetDimensions(), inputNode.GetSpacing(), params,
+                            channels=2 if secondNode is not None else 1)
+        gridText = " × ".join(str(d) for d in job["shape"][::-1])
+        offerCrop = job["large"] and not cropped
+        items = []
+
+        if job["large"]:
+            advice = ("Consider filtering only the region you need: <b>Crop with ROI first</b> places an adjustable "
+                      "box." if not cropped else "Consider making the crop ROI smaller.")
+            items.append(f'<span style="color:#d9534f;"><b>Large volume:</b> about {job["voxels"] / 1e6:.0f} million '
+                         f'voxels on the model\'s grid ({gridText}), roughly {formatByteSize(job["memoryBytes"])} of '
+                         f'memory and {job["windows"]} windows to process. This can take a long time (especially on '
+                         f'CPU) or run out of memory. {advice}</span>')
+
+        if target == FILTER_TARGET_PET:
+            headline = "Filtering changes SUV values"
+            items.append("SUVmax, SUVmean, MTV and TLG measured on the filtered volume <b>will differ</b> from the "
+                         "original. Denoising removes voxel noise, which usually lowers SUVmax, and it can change "
+                         "the contrast and apparent size of small lesions.")
+            if targetSpacing is not None:
+                items.append(f"The image is resampled from {spacingText} mm to "
+                             f"{' × '.join(f'{v:g}' for v in targetSpacing)} mm voxels and the result stays on that "
+                             "grid. Resampling alone already changes SUVmax.")
+            suvNotes = filterSuvNotes(self._filterNotes)
+            if suvNotes:
+                items.append("Bias reported for this model on its validation data: <b>"
+                             + esc("; ".join(suvNotes)) + "</b>. Other scanners, reconstructions and tracers "
+                             "can behave differently (see Model info).")
+            if params["prevent_negative"]:
+                items.append("Negative voxel values are set to 0.")
+            if cropped:
+                items.append("Only the region inside the crop ROI is filtered. The new volume covers only that "
+                             "region, so SUV ROIs outside it will show '(outside PET)'.")
+            roiCount = 0
+            if self.roiNode is not None:
+                roiCount = sum(1 for i in range(self.roiNode.GetNumberOfControlPoints())
+                               if self.logic.isControlPointDefined(self.roiNode, i))
+            reMeasured = f" ({roiCount} ROI{'s' if roiCount != 1 else ''} will be re-measured)" if roiCount else ""
+            items.append(f"The views, the MIP and the SUV ROIs switch to the new volume{reMeasured}. To go back, "
+                         f"select <b>{esc(sourceName)}</b> as SPECT/PET and press Go.")
+        else:
+            headline = "Filtering changes CT/MR voxel values"
+            items.append("Voxel values (e.g. Hounsfield units) of the filtered volume will differ from the original. "
+                         "SUV measurements are not affected: they are read from the SPECT/PET volume.")
+            if targetSpacing is not None:
+                items.append(f"The image is resampled from {spacingText} mm to "
+                             f"{' × '.join(f'{v:g}' for v in targetSpacing)} mm voxels and the result stays on that grid.")
+            if params["prevent_negative"]:
+                items.append("<b>This model sets negative values to 0</b>, which removes negative Hounsfield units "
+                             "(air, lung, fat). Check that the model is really meant for CT/MR.")
+            if cropped:
+                items.append("Only the region inside the crop ROI is filtered; the new volume covers only that region.")
+            items.append(f"The views switch to the new volume. To go back, select <b>{esc(sourceName)}</b> "
+                         "as CT/MRI and press Go.")
+
+        if cropped:
+            items.append(f"The original <b>{esc(sourceName)}</b> itself is not cropped. The crop ROI is removed "
+                         "after filtering.")
+        if secondNode is not None:
+            items.append(f"Dual-channel model: <b>{esc(secondNode.GetName())}</b> is used as the second input.")
+        if not job["large"]:
+            items.append(f"Working grid about {gridText} voxels; roughly {formatByteSize(job['memoryBytes'])} "
+                         "of memory needed.")
+        items.append("Research use only: filtered values must not replace measurements on the original images "
+                     "for clinical reporting.")
+
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setIcon(qt.QMessageBox.Warning)
+        box.setWindowTitle("EasyFusion - AI post-processing filter")
+        box.setTextFormat(qt.Qt.RichText)
+        box.setText(f"<b>{headline}</b><br>Model: {esc(modelName)}<br>"
+                    f"The original <b>{esc(sourceName)}</b> is not modified. "
+                    f"The result is a new volume: <b>{esc(outputName)}</b>")
+        box.setInformativeText("<ul>" + "".join(f"<li>{item}</li>" for item in items) + "</ul>")
+        box.addButton("Apply Filter", qt.QMessageBox.AcceptRole)
+        cropButton = box.addButton("Crop with ROI first", qt.QMessageBox.ActionRole) if offerCrop else None
+        cancelButton = box.addButton(qt.QMessageBox.Cancel)
+        box.setDefaultButton(cropButton if cropButton is not None else cancelButton)
+        box.setEscapeButton(cancelButton)
+        box.exec_()
+        clicked = box.clickedButton()
+        role = box.buttonRole(clicked) if clicked is not None else None
+        if role == qt.QMessageBox.AcceptRole:
+            return "apply"
+        if role == qt.QMessageBox.ActionRole:
+            return "crop"
+        return None
+
+    @staticmethod
+    def ensureFilterDependencies():
+        """PyTorch, MONAI and einops; offers to install what is missing. True when all of them can be imported."""
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            # PyTorch is not installed from here: in the PyTorch Utils module the user can pick the
+            # build (CUDA version / CPU) that matches their GPU and driver.
+            if slicer.util.confirmOkCancelDisplay(
+                    "AI filters need PyTorch, which is not installed.\n\n"
+                    "Install it in the PyTorch Utils module, where you can choose the CUDA version that matches "
+                    "your GPU (or CPU only), then restart Slicer and try again.\n\n"
+                    "Open PyTorch Utils now?"):
+                try:
+                    slicer.util.selectModule("PyTorchUtils")
+                except Exception:
+                    slicer.util.errorDisplay("The PyTorch Utils module was not found. Install the 'PyTorch' "
+                                             "extension from the Extensions Manager and restart Slicer.")
+            return False
+        for moduleName, requirement in (("monai", "monai"), ("einops", FILTER_EINOPS_REQUIREMENT)):
+            try:
+                importlib.import_module(moduleName)
+                continue
+            except ImportError:
+                pass
+            if not slicer.util.confirmOkCancelDisplay(
+                    f"AI filters need the Python package '{moduleName}', which is not installed.\n"
+                    f"Install it now ({requirement})? You may need to restart Slicer afterwards."):
+                return False
+            qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+            try:
+                slicer.util.pip_install(requirement)
+            finally:
+                qt.QApplication.restoreOverrideCursor()
+            importlib.invalidate_caches()
+            importlib.import_module(moduleName)  # raises if the installation did not work
+        return True
+
+    def showFilteredVolume(self, sourceNode, filteredNode, otherNode, target):
+        """
+        Show a freshly filtered volume in place of its source: same color map and window, same slice positions
+        and zoom, the MIP (PET) and the SUV ROIs follow. The source volume stays in the scene, untouched.
+        """
+        self.logic.copyScalarDisplaySettings(sourceNode, filteredNode)
+        if otherNode is not None and not slicer.mrmlScene.IsNodePresent(otherNode):
+            otherNode = None
+        if target == FILTER_TARGET_PET:
+            petNode, ctNode = filteredNode, otherNode
+        else:
+            petNode, ctNode = otherNode, filteredNode
+        # Both selectors set explicitly: the other one must still show the volume it showed before the run
+        with self.selectorsSetByPanel():
+            if petNode is not None:
+                self.inputVolumeSelector.setCurrentNode(petNode)
+            if ctNode is not None:
+                self.inputVolumeSelectorCT.setCurrentNode(ctNode)
+
+        if petNode is not None and ctNode is not None:
+            opacities = self.logic.foregroundOpacities(sourceNode)  # keep the user's fusion opacity
+            self.logic.rememberVolumes(petNode, ctNode)
+            self.logic.applyViewRoles(petNode, ctNode)
+            self.logic.restoreForegroundOpacities(opacities)
+            # Same anatomy, so nothing is re-fitted: every view keeps its slice, pan and zoom
+        else:
+            slicer.util.setSliceViewerLayers(background=filteredNode)
+        if target == FILTER_TARGET_PET:
+            self.logic.moveMipToVolume(sourceNode, filteredNode)
+        self.scheduleRoiUpdate()
+
 
 # ---------------------------------------------------------------------------
 # Logic
 # ---------------------------------------------------------------------------
+
+class SliceWindowInfoOverlay:
+    """
+    Window / level of the CT and display range of the SPECT/PET in the bottom-right corner of every slice view.
+    Each view lists the volumes it shows (foreground above background), so fusion views have two lines,
+    CT-only and PET-only views one. Pure VTK text on the views: nothing is added to the scene or saved.
+
+    It follows window / level changes from anywhere (presets, F5-F9, mouse drags, Volumes module) by
+    observing the display nodes of the shown volumes, and view contents by observing the slice composite nodes.
+    Slicer's own annotations (Data Probe) rewrite all four corners of the view's built-in corner annotation,
+    so this uses a separate text actor of its own.
+    """
+
+    def __init__(self, volumesCallback):
+        """volumesCallback() -> (SPECT/PET node, CT/MRI node) currently selected in the panel (either may be None)."""
+        self.enabled = True
+        self._volumes = volumesCallback
+        self._actors = {}         # slice view name -> (renderer, vtkCornerAnnotation)
+        self._lastText = {}       # slice view name -> (text, color) last drawn
+        self._observations = {}   # MRML node ID -> (node, observer tag)
+        self._timer = qt.QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(WINDOW_INFO_UPDATE_MS)
+        self._timer.connect("timeout()", self.update)
+
+    def setEnabled(self, enabled):
+        self.enabled = bool(enabled)
+        if self.enabled:
+            self.scheduleUpdate()
+        else:
+            self.clear()
+
+    def scheduleUpdate(self, caller=None, event=None):
+        if not self._timer.isActive():  # not restarted: keeps updating during a continuous drag
+            self._timer.start()
+
+    # --- helpers ---------------------------------------------------------
+
+    @staticmethod
+    def _sliceWidgets():
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return []
+        widgets = []
+        for name in layoutManager.sliceViewNames():
+            sliceWidget = layoutManager.sliceWidget(name)
+            if sliceWidget is None or sliceWidget.sliceView() is None:
+                continue
+            compositeNode = sliceWidget.mrmlSliceCompositeNode()
+            if compositeNode is None or not slicer.mrmlScene.IsNodePresent(compositeNode):
+                continue  # widget left over from a previous layout / scene
+            widgets.append((name, sliceWidget, compositeNode))
+        return widgets
+
+    @staticmethod
+    def _fontSize():
+        try:
+            return int(qt.QSettings().value(DATA_PROBE_FONT_SIZE_SETTING, WINDOW_INFO_DEFAULT_FONT_SIZE))
+        except (TypeError, ValueError):
+            return WINDOW_INFO_DEFAULT_FONT_SIZE
+
+    def _describe(self, volumeNode, petNode, ctNode):
+        """Window info line of one shown volume, or None when it has no scalar display."""
+        displayNode = volumeNode.GetDisplayNode() if volumeNode is not None else None
+        if displayNode is None or not hasattr(displayNode, "GetWindow"):
+            return None
+        window, level = displayNode.GetWindow(), displayNode.GetLevel()
+        if volumeNode.GetAttribute(PET_ONLY_VOLUME_ATTRIBUTE):
+            # Inverted-grey twin of the PET: same window as the PET, named and labelled after it
+            volumeNode = volumeNode.GetNodeReference(PET_ONLY_SOURCE_ROLE) or petNode or volumeNode
+        imageData = volumeNode.GetImageData()
+        scalarMinimum = imageData.GetScalarRange()[0] if imageData is not None and imageData.GetNumberOfPoints() else None
+        unit = voxelUnitLabel(volumeNode)
+        nodeID = volumeNode.GetID()
+        if ctNode is not None and nodeID == ctNode.GetID():
+            kind = "CT" if scalarMinimum is None or looksLikeCT(scalarMinimum) else "MRI"
+        elif (petNode is not None and nodeID == petNode.GetID()) or unit == "SUV":
+            kind = "PET" if unit == "SUV" else "SPECT/PET"
+        elif scalarMinimum is not None and looksLikeCT(scalarMinimum):
+            kind = "CT"
+        else:
+            name = volumeNode.GetName() or "Volume"
+            kind = name if len(name) <= 20 else name[:19] + "…"
+        return formatWindowInfoLine(kind, window, level, unit)
+
+    def _viewContent(self, compositeNode, petNode, ctNode):
+        """(text, text color) for one slice view."""
+        scene = slicer.mrmlScene
+        background = scene.GetNodeByID(compositeNode.GetBackgroundVolumeID() or "")
+        foreground = scene.GetNodeByID(compositeNode.GetForegroundVolumeID() or "")
+        lines = []
+        if foreground is not None and compositeNode.GetForegroundOpacity() > 0.0:
+            lines.append(self._describe(foreground, petNode, ctNode))
+        if background is not None:
+            lines.append(self._describe(background, petNode, ctNode))
+        darkBackground = not (background is not None and background.GetAttribute(PET_ONLY_VOLUME_ATTRIBUTE))
+        color = WINDOW_INFO_LIGHT_TEXT if darkBackground else WINDOW_INFO_DARK_TEXT
+        return "\n".join(line for line in lines if line), color
+
+    def _actorFor(self, name, sliceView):
+        renderWindow = sliceView.renderWindow()
+        entry = self._actors.get(name)
+        if entry is not None and renderWindow.HasRenderer(entry[0]):
+            return entry[1]
+        renderer = renderWindow.GetRenderers().GetFirstRenderer()
+        if renderer is None:
+            return None
+        actor = vtk.vtkCornerAnnotation()
+        actor.SetPickable(False)
+        size = self._fontSize()
+        actor.SetMaximumFontSize(size)
+        actor.SetMinimumFontSize(size)
+        actor.SetNonlinearFontScaleFactor(1)
+        actor.GetTextProperty().SetFontFamilyToArial()
+        renderer.AddViewProp(actor)
+        self._actors[name] = (renderer, actor)
+        self._lastText.pop(name, None)
+        return actor
+
+    def _syncObservations(self, nodes):
+        """Observe exactly these MRML nodes (Modified event)."""
+        wanted = {node.GetID(): node for node in nodes if node is not None and node.GetID()}
+        for nodeID in list(self._observations):
+            node, tag = self._observations[nodeID]
+            if nodeID not in wanted or wanted[nodeID] is not node:
+                node.RemoveObserver(tag)
+                del self._observations[nodeID]
+        for nodeID, node in wanted.items():
+            if nodeID not in self._observations:
+                tag = node.AddObserver(vtk.vtkCommand.ModifiedEvent, self.scheduleUpdate)
+                self._observations[nodeID] = (node, tag)
+
+    # --- update / clear ----------------------------------------------------
+
+    def update(self):
+        if not self.enabled:
+            return
+        if sceneIsBusy():
+            self._timer.start()  # try again once the scene is idle
+            return
+        try:
+            petNode, ctNode = self._volumes()
+        except Exception:
+            petNode, ctNode = None, None
+        observed = []
+        liveNames = set()
+        for name, sliceWidget, compositeNode in self._sliceWidgets():
+            liveNames.add(name)
+            observed.append(compositeNode)
+            for volumeID in (compositeNode.GetBackgroundVolumeID(), compositeNode.GetForegroundVolumeID()):
+                volumeNode = slicer.mrmlScene.GetNodeByID(volumeID or "")
+                if volumeNode is not None:
+                    observed.append(volumeNode.GetDisplayNode())
+            try:
+                text, color = self._viewContent(compositeNode, petNode, ctNode)
+            except Exception:
+                logging.debug(f"EasyFusion: no window info for slice view {name}", exc_info=True)
+                text, color = "", WINDOW_INFO_LIGHT_TEXT
+            sliceView = sliceWidget.sliceView()
+            actor = self._actorFor(name, sliceView)
+            if actor is None or self._lastText.get(name) == (text, color):
+                continue
+            actor.SetText(WINDOW_INFO_CORNER, text)
+            textProperty = actor.GetTextProperty()
+            textProperty.SetColor(*color)
+            textProperty.SetShadow(color == WINDOW_INFO_LIGHT_TEXT)  # a dark shadow only helps light text
+            self._lastText[name] = (text, color)
+            sliceView.scheduleRender()
+        # Views that no longer exist: forget them (only Python references)
+        for name in [name for name in self._actors if name not in liveNames]:
+            renderer, actor = self._actors.pop(name)
+            renderer.RemoveViewProp(actor)
+            self._lastText.pop(name, None)
+        self._syncObservations(observed)
+
+    def clear(self):
+        """Remove the text from every view and stop observing."""
+        self._timer.stop()
+        self._syncObservations([])
+        widgets = {name: sliceWidget for name, sliceWidget, _ in self._sliceWidgets()}
+        for name, (renderer, actor) in self._actors.items():
+            renderer.RemoveViewProp(actor)
+            if name in widgets:
+                widgets[name].sliceView().scheduleRender()
+        self._actors = {}
+        self._lastText = {}
+
 
 class MipRoiOverlay:
     """
@@ -1981,6 +3763,8 @@ class MipRoiOverlay:
                 renderer.AddViewProp(actor)
                 props.append(actor)
             for _, center, text, _ in entries:
+                if not text:
+                    continue
                 actor = self._textActor(text, center)
                 renderer.AddViewProp(actor)
                 props.append(actor)
@@ -2014,12 +3798,77 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         colorFunction.AddRGBPoint(lower, 1.0, 1.0, 1.0)
         colorFunction.AddRGBPoint(upper, 0.0, 0.0, 0.0)
         if flatOpacity:
+            # Opacity 1 over the whole data range. VTK sizes the GPU opacity table as (data range / smallest
+            # distance between points); with points only at lower / upper, a narrow grey range on a volume with
+            # large values (e.g. Bq/mL, counts) needs millions of entries: "required texture size ... falling
+            # back to maximum allowed". Points at the data minimum / maximum give a tiny table, same result.
+            opacityLower, opacityUpper = lower, upper
+            volumeNode = vrDisplayNode.GetVolumeNode()
+            imageData = volumeNode.GetImageData() if volumeNode is not None else None
+            if imageData is not None and imageData.GetNumberOfPoints() > 0:
+                dataMinimum, dataMaximum = imageData.GetScalarRange()
+                opacityLower, opacityUpper = min(lower, dataMinimum), max(upper, dataMaximum)
             scalarOpacity = propertyNode.GetScalarOpacity()
             scalarOpacity.RemoveAllPoints()
-            scalarOpacity.AddPoint(lower, 1.0)
-            scalarOpacity.AddPoint(upper, 1.0)
+            scalarOpacity.AddPoint(opacityLower, 1.0)
+            if opacityUpper > opacityLower:
+                scalarOpacity.AddPoint(opacityUpper, 1.0)
         propertyNode.Modified()
         vrDisplayNode.Modified()
+
+    @staticmethod
+    def mipThreeDWidget():
+        """
+        The 3D widget of the MIP view (view "1"). Not simply 3D widget 0: widgets are numbered in creation order,
+        and after another module's layout (e.g. the dosimetry layouts with 3D views 1 and 2) widget 0 can be a
+        view that is not shown in the EasyFusion layouts.
+        """
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return None
+        mipViewNode = slicer.mrmlScene.GetSingletonNode(MIP_VIEW_TAG, "vtkMRMLViewNode")
+        firstVisible = None
+        for index in range(layoutManager.threeDViewCount):
+            widget = layoutManager.threeDWidget(index)
+            if widget is None:
+                continue
+            viewNode = widget.mrmlViewNode()
+            if mipViewNode is not None and viewNode is not None and viewNode.GetID() == mipViewNode.GetID():
+                return widget
+            if firstVisible is None and widget.isVisible():
+                firstVisible = widget
+        if firstVisible is not None:
+            return firstVisible
+        return layoutManager.threeDWidget(0) if layoutManager.threeDViewCount > 0 else None
+
+    @staticmethod
+    def mipViewNode():
+        widget = Easy_fusionLogic.mipThreeDWidget()
+        viewNode = widget.mrmlViewNode() if widget is not None else None
+        if viewNode is None:
+            viewNode = slicer.mrmlScene.GetSingletonNode(MIP_VIEW_TAG, "vtkMRMLViewNode")
+        return viewNode
+
+    @staticmethod
+    def showMipOnlyInMipView(vrDisplayNode):
+        """
+        Render the MIP volume in the MIP view only, and make that view use the MIP technique. A volume rendering
+        without view IDs is drawn in every 3D view, each with its own technique: hidden views left over from
+        other layouts (e.g. 3D view 2 of the dosimetry layouts) then render it as Standard (composite).
+        Returns the MIP view node (None if there is no 3D view node yet).
+        """
+        viewNode = Easy_fusionLogic.mipViewNode()
+        if vrDisplayNode is None or viewNode is None:
+            return None
+        viewIDs = [vrDisplayNode.GetNthViewNodeID(i) for i in range(vrDisplayNode.GetNumberOfViewNodeIDs())]
+        if viewIDs != [viewNode.GetID()]:
+            wasModifying = vrDisplayNode.StartModify()
+            vrDisplayNode.RemoveAllViewNodeIDs()
+            vrDisplayNode.AddViewNodeID(viewNode.GetID())
+            vrDisplayNode.EndModify(wasModifying)
+        if viewNode.GetRaycastTechnique() != MIP_RAYCAST_TECHNIQUE:
+            viewNode.SetRaycastTechnique(MIP_RAYCAST_TECHNIQUE)
+        return viewNode
 
     @staticmethod
     def getVolumeMaximum(volumeNode):
@@ -2049,7 +3898,7 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
     def reapplyRestoredCustomLayout():
         """
         Slicer restores the last used layout at startup, before modules can register their layouts. If that
-        was an Lvgvs layout, it was applied without a description. Re-applying the arrangement now that the
+        was an Epona layout, it was applied without a description. Re-applying the arrangement now that the
         description exists is the same call Slicer's own vtkMRMLLayoutLogic makes for this situation.
         """
         layoutManager = slicer.app.layoutManager()
@@ -2098,6 +3947,30 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             node.SetHideFromEditors(True)
             node = slicer.mrmlScene.AddNode(node)
         return node
+
+    @staticmethod
+    def isModuleShown():
+        try:
+            return slicer.util.moduleSelector().selectedModule == MODULE_NAME
+        except Exception:
+            return False
+
+    @staticmethod
+    def writeActiveModuleFlag():
+        """At save: remember in the scene whether EasyFusion is the module shown (like the Taranis modules)."""
+        active = Easy_fusionLogic.isModuleShown()
+        settingsNode = Easy_fusionLogic.getSettingsNode(create=active)
+        if settingsNode is not None:
+            settingsNode.SetParameter(SETTINGS_ACTIVE_MODULE, "true" if active else "false")
+
+    @staticmethod
+    def reopenModuleSavedAsActive():
+        """After a scene load: open EasyFusion if it was the module shown when the scene was saved."""
+        settingsNode = Easy_fusionLogic.getSettingsNode(create=False)
+        if settingsNode is None or settingsNode.GetParameter(SETTINGS_ACTIVE_MODULE) != "true":
+            return
+        if not Easy_fusionLogic.isModuleShown():
+            slicer.util.selectModule(MODULE_NAME)
 
     def rememberVolumes(self, petNode, ctNode):
         settingsNode = self.getSettingsNode()
@@ -2350,31 +4223,123 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
             self.applyViewRoles(pet, ct)
 
     @staticmethod
+    def secondaryViewportWindow():
+        """The Monitor 2 window (floating dock holding the MIP view), or None if it is docked / not shown."""
+        candidates = []
+        widget = Easy_fusionLogic.mipThreeDWidget()
+        if widget is not None:
+            candidates.append(widget.window())
+        candidates += [w for w in qt.QApplication.topLevelWidgets() if w.windowTitle == DUAL_MONITOR_WINDOW_TITLE]
+        for window in candidates:
+            if window is None or window.inherits("qSlicerMainWindow") or window.inherits("QMainWindow"):
+                continue
+            if window.inherits("QDockWidget") and not getattr(window, "floating", True):
+                continue  # docked into the main window by the user: leave it there
+            return window
+        return None
+
+    @staticmethod
+    def secondaryScreen():
+        """A screen other than the one showing the main window, or None with a single screen."""
+        mainWindow = slicer.util.mainWindow()
+        screens = list(qt.QGuiApplication.screens())
+        if mainWindow is None or len(screens) < 2:
+            return None
+        mainCenter = mainWindow.frameGeometry.center()
+        return next((screen for screen in screens if not screen.geometry.contains(mainCenter)), None)
+
+    @staticmethod
     def placeSecondaryViewportWindow():
-        """Best effort: show the Monitor 2 window maximized on a screen other than the main window's."""
+        """Give the Monitor 2 window normal window buttons and show it maximized on the second screen."""
+        if sceneIsBusy():
+            # Never move windows while the layout manager is rebuilding views for a scene being loaded
+            runWhenSceneSettled(Easy_fusionLogic.placeSecondaryViewportWindow)
+            return
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None or layoutManager.layout not in DUAL_MONITOR_LAYOUT_IDS:
+            return
         try:
-            window = None
-            for widget in qt.QApplication.topLevelWidgets():
-                if widget.windowTitle == DUAL_MONITOR_WINDOW_TITLE:
-                    window = widget
-                    break
+            window = Easy_fusionLogic.secondaryViewportWindow()
             if window is None:
                 return
-            window.show()
-            mainWindow = slicer.util.mainWindow()
-            screens = list(qt.QGuiApplication.screens())
-            if mainWindow is None or len(screens) < 2:
+            # A floating view window is a tool window (close button only); make it a normal window
+            window.setWindowFlags(qt.Qt.Window | qt.Qt.CustomizeWindowHint | qt.Qt.WindowTitleHint
+                                  | qt.Qt.WindowSystemMenuHint | qt.Qt.WindowMinMaxButtonsHint
+                                  | qt.Qt.WindowCloseButtonHint)
+            screen = Easy_fusionLogic.secondaryScreen()
+            if screen is None:
+                window.show()  # single screen: do not cover the main window
                 window.raise_()
                 return
-            mainCenter = mainWindow.frameGeometry.center()
-            otherScreen = next((screen for screen in screens if not screen.geometry.contains(mainCenter)), None)
-            if otherScreen is not None:
-                window.showNormal()
-                window.setGeometry(otherScreen.availableGeometry)
-                window.showMaximized()
+            window.setGeometry(screen.availableGeometry)  # on the second screen first, then maximized there
+            window.showMaximized()
             window.raise_()
         except Exception:
             logging.exception("EasyFusion: could not place the Monitor 2 window; drag it to the second screen manually")
+
+    @staticmethod
+    def placeSecondaryViewportWindowAfterLoad():
+        """After a scene load (or at startup) in a dual monitor layout: Monitor 2 window maximized on screen 2."""
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None or layoutManager.layout not in DUAL_MONITOR_LAYOUT_IDS:
+            return
+        qt.QTimer.singleShot(DUAL_MONITOR_PLACE_DELAY_MS, Easy_fusionLogic.placeSecondaryViewportWindow)
+
+    # --- Filtered volumes --------------------------------------------------
+
+    @staticmethod
+    def copyScalarDisplaySettings(sourceNode, targetNode):
+        """Same color map, window / level and interpolation, so a filtered volume is shown like its source."""
+        sourceDisplay = sourceNode.GetDisplayNode() if sourceNode is not None else None
+        if sourceDisplay is None or targetNode is None:
+            return
+        if targetNode.GetDisplayNode() is None:
+            targetNode.CreateDefaultDisplayNodes()
+        targetDisplay = targetNode.GetDisplayNode()
+        wasModifying = targetDisplay.StartModify()
+        if sourceDisplay.GetColorNodeID():
+            targetDisplay.SetAndObserveColorNodeID(sourceDisplay.GetColorNodeID())
+        targetDisplay.SetAutoWindowLevel(False)
+        targetDisplay.SetWindow(sourceDisplay.GetWindow())
+        targetDisplay.SetLevel(sourceDisplay.GetLevel())
+        targetDisplay.SetInterpolate(sourceDisplay.GetInterpolate())
+        targetDisplay.EndModify(wasModifying)
+
+    @staticmethod
+    def foregroundOpacities(volumeNode):
+        """{composite node: opacity} of the EasyFusion views that show volumeNode as foreground (fusion views)."""
+        if volumeNode is None:
+            return {}
+        return {compositeNode: compositeNode.GetForegroundOpacity()
+                for _, _, compositeNode in Easy_fusionLogic.roleSliceNodes()
+                if compositeNode.GetForegroundVolumeID() == volumeNode.GetID()}
+
+    @staticmethod
+    def restoreForegroundOpacities(opacities):
+        for compositeNode, opacity in opacities.items():
+            if abs(compositeNode.GetForegroundOpacity() - opacity) > 1e-6:
+                compositeNode.SetForegroundOpacity(opacity)
+
+    def moveMipToVolume(self, sourceNode, targetNode):
+        """If sourceNode is the MIP in the 3D view, show targetNode there instead, with the same grey range."""
+        vrLogic = slicer.modules.volumerendering.logic()
+        sourceVr = vrLogic.GetFirstVolumeRenderingDisplayNode(sourceNode)
+        if sourceVr is None or not sourceVr.GetVisibility():
+            return False
+        lower = upper = None
+        propertyNode = sourceVr.GetVolumePropertyNode()
+        if propertyNode is not None:
+            lower, upper = propertyNode.GetVolumeProperty().GetRGBTransferFunction(0).GetRange()
+        if lower is None or not upper > lower:
+            displayNode = targetNode.GetDisplayNode()
+            lower = displayNode.GetLevel() - displayNode.GetWindow() / 2.0
+            upper = displayNode.GetLevel() + displayNode.GetWindow() / 2.0
+        targetVr = vrLogic.CreateDefaultVolumeRenderingNodes(targetNode)
+        self.showOnlyThisVolumeRendering(targetNode)  # only one MIP at a time
+        targetVr.SetVisibility(True)
+        self.setMIPRange(targetVr, lower, upper, flatOpacity=True)
+        self.showMipOnlyInMipView(targetVr)
+        return True
 
     # --- Custom Hot Iron ---------------------------------------------------
 
@@ -2512,16 +4477,62 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         return color
 
     @staticmethod
+    def getRoiThreshold(node, pointID, defaultThreshold):
+        """
+        (mode, value) of this ROI's segment threshold. An ROI without one (just placed, or from a scene saved
+        before thresholds were per ROI) gets defaultThreshold, the panel's current setting, and keeps it.
+        """
+        threshold = parseRoiThreshold(node.GetAttribute(ROI_THRESHOLD_ATTRIBUTE + pointID))
+        if threshold is None:
+            threshold = (defaultThreshold[0], float(defaultThreshold[1]))
+            node.SetAttribute(ROI_THRESHOLD_ATTRIBUTE + pointID, formatRoiThreshold(*threshold))
+        return threshold
+
+    @staticmethod
+    def setRoiThreshold(node, pointID, mode, value):
+        text = formatRoiThreshold(mode, value)
+        if node.GetAttribute(ROI_THRESHOLD_ATTRIBUTE + pointID) != text:
+            node.SetAttribute(ROI_THRESHOLD_ATTRIBUTE + pointID, text)
+
+    @staticmethod
+    def getRoiOrigin(node, pointID):
+        """ROI_ORIGIN_USER or ROI_ORIGIN_AI. ROIs without the flag were placed by hand, so they become "user"."""
+        origin = node.GetAttribute(ROI_ORIGIN_ATTRIBUTE + pointID)
+        if origin not in (ROI_ORIGIN_USER, ROI_ORIGIN_AI):
+            origin = ROI_ORIGIN_USER
+            node.SetAttribute(ROI_ORIGIN_ATTRIBUTE + pointID, origin)
+        return origin
+
+    @staticmethod
+    def setRoiOrigin(node, pointID, origin):
+        if origin not in (ROI_ORIGIN_USER, ROI_ORIGIN_AI):
+            raise ValueError(f"ROI origin must be '{ROI_ORIGIN_USER}' or '{ROI_ORIGIN_AI}', not {origin!r}")
+        node.SetAttribute(ROI_ORIGIN_ATTRIBUTE + pointID, origin)
+
+    def addRoi(self, node, centerWorld, radius, thresholdMode, thresholdValue, origin=ROI_ORIGIN_AI):
+        """
+        Add an ROI from code, e.g. from an AI lesion detector, with its own radius, threshold and origin flag.
+        The panel picks it up on its next update like a hand-placed ROI. Returns the ROI's control point ID.
+        """
+        index = node.AddControlPoint([float(c) for c in centerWorld])
+        pointID = node.GetNthControlPointID(index)
+        self.setRoiRadius(node, pointID, radius)
+        self.setRoiThreshold(node, pointID, thresholdMode, thresholdValue)
+        self.setRoiOrigin(node, pointID, origin)
+        return pointID
+
+    PER_ROI_ATTRIBUTES = (ROI_RADIUS_ATTRIBUTE, ROI_NUMBER_ATTRIBUTE, ROI_COLOR_ATTRIBUTE,
+                          ROI_THRESHOLD_ATTRIBUTE, ROI_ORIGIN_ATTRIBUTE)
+
+    @staticmethod
     def forgetRoi(node, pointID):
-        node.RemoveAttribute(ROI_RADIUS_ATTRIBUTE + pointID)
-        node.RemoveAttribute(ROI_NUMBER_ATTRIBUTE + pointID)
-        node.RemoveAttribute(ROI_COLOR_ATTRIBUTE + pointID)
+        for prefix in Easy_fusionLogic.PER_ROI_ATTRIBUTES:
+            node.RemoveAttribute(prefix + pointID)
 
     @staticmethod
     def forgetAllRois(node):
         for name in list(node.GetAttributeNames()):
-            if (name.startswith(ROI_RADIUS_ATTRIBUTE) or name.startswith(ROI_NUMBER_ATTRIBUTE)
-                    or name.startswith(ROI_COLOR_ATTRIBUTE)):
+            if name.startswith(Easy_fusionLogic.PER_ROI_ATTRIBUTES):
                 node.RemoveAttribute(name)
         node.SetAttribute(ROI_NEXT_NUMBER_ATTRIBUTE, "1")
 
@@ -2876,3 +4887,483 @@ class Easy_fusionLogic(ScriptedLoadableModuleLogic):
         segmentationNode = self.findRoiSegmentationNode()
         if segmentationNode is not None:
             slicer.mrmlScene.RemoveNode(segmentationNode)
+
+
+# ---------------------------------------------------------------------------
+# AI post-processing filters
+# ---------------------------------------------------------------------------
+
+class FilterProgressDialog:
+    """
+    Modal progress window of a filter run. Calling it updates the text / bar and lets Qt repaint;
+    once Cancel was pressed, the next call raises FilterCancelled (the run then cleans up after itself).
+    """
+
+    def __init__(self, title):
+        dialog = qt.QProgressDialog(slicer.util.mainWindow())
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(qt.Qt.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumWidth(420)
+        dialog.setRange(0, 0)  # busy indicator until the number of windows is known
+        dialog.setLabelText("Preparing…")
+        dialog.show()
+        self.dialog = dialog
+        slicer.app.processEvents()
+
+    def __call__(self, text, done=0, total=0):
+        if self.dialog.wasCanceled:
+            raise FilterCancelled()
+        if total > 0:
+            done = min(int(done), int(total))
+            self.dialog.setLabelText(f"{text}\nWindow {done} of {total}")
+            self.dialog.setRange(0, int(total))
+            self.dialog.setValue(done)
+        else:
+            self.dialog.setLabelText(text)
+            self.dialog.setRange(0, 0)
+        slicer.app.processEvents()
+        if self.dialog.wasCanceled:
+            raise FilterCancelled()
+
+    def close(self):
+        self.dialog.close()
+        self.dialog.deleteLater()
+
+
+class Easy_fusionFilterLogic:
+    """
+    AI post-processing (denoising / super-resolution) with the models of the Belenos PET Denoise module.
+    Same pipeline as PETDenoise: linear resampling to the model's voxel spacing, sliding-window inference
+    (gaussian blending, 25% overlap), result = input - predicted noise, optional clipping of negative values.
+    The source volume is never written to: the result is always a new volume.
+    """
+
+    @staticmethod
+    def petDenoiseModelFolder():
+        """Model folder last used in the PETDenoise module (its model_config.ini), if that module is installed."""
+        directories = []
+        try:
+            directories.append(os.path.dirname(slicer.modules.petdenoise.path))
+        except AttributeError:
+            pass
+        # Usual extension layout: <extension>/Easy_fusion/Easy_fusion.py next to <extension>/PETDenoise/
+        directories.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "PETDenoise"))
+        for directory in directories:
+            iniPath = os.path.join(directory, "model_config.ini")
+            if not os.path.isfile(iniPath):
+                continue
+            config = configparser.ConfigParser()
+            try:
+                config.read(iniPath)
+            except configparser.Error:
+                continue
+            folder = config.get("ModelFolder", "path", fallback="")
+            if folder and os.path.isdir(folder):
+                return folder
+        return None
+
+    @staticmethod
+    def uniqueVolumeName(baseName):
+        name, number = baseName, 1
+        while slicer.mrmlScene.GetFirstNodeByName(name) is not None:
+            name = f"{baseName}_{number}"
+            number += 1
+        return name
+
+    @staticmethod
+    def chooseDevice(torch, forceCPU):
+        """GPU when available with at least FILTER_MIN_VRAM_GB of memory (as in PETDenoise), otherwise CPU."""
+        cpu = torch.device("cpu")
+        if forceCPU:
+            return cpu, "CPU, forced"
+        if not torch.cuda.is_available():
+            return cpu, "CPU"
+        try:
+            properties = torch.cuda.get_device_properties(0)
+        except Exception:
+            logging.exception("EasyFusion: could not query the GPU")
+            return cpu, "CPU, GPU could not be queried"
+        vramGb = properties.total_memory / 1024.0 ** 3
+        if vramGb < FILTER_MIN_VRAM_GB:
+            return cpu, f"CPU, GPU has only {vramGb:.1f} GB"
+        return torch.device("cuda"), f"GPU {properties.name}, {vramGb:.1f} GB"
+
+    @staticmethod
+    def buildNetwork(params, inChannels):
+        """
+        Network of a PETDenoise model. Class structure and attribute names (unet / model / gcfn) are exactly those
+        of the PETDenoise module, so its .pth state dicts load unchanged.
+        """
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from monai import __version__ as monaiVersion
+        from monai.networks.nets import UNet, SwinUNETR
+        from packaging import version
+
+        swinExtra = {"img_size": (64, 64, 64)} if version.parse(monaiVersion) < version.parse("1.5") else {}
+
+        class DenoiseUNet(nn.Module):
+            def __init__(self, in_channels=1, out_channels=1, channels=(32, 64, 128, 256, 512), num_res_units=2,
+                         strides=(2, 2, 2, 2), kernel_size=3, up_kernel_size=3):
+                super().__init__()
+                self.unet = UNet(strides=strides, num_res_units=num_res_units, kernel_size=kernel_size,
+                                 up_kernel_size=up_kernel_size, spatial_dims=3, in_channels=in_channels,
+                                 out_channels=out_channels, channels=channels)
+
+            def forward(self, x):
+                return self.unet(x)
+
+        class SwinDenoiser(nn.Module):
+            def __init__(self, in_channels=1, out_channels=1, feature_size=48, heads=(6, 12, 24, 48),
+                         depths=(2, 3, 3, 2), do_rate=0.1):
+                super().__init__()
+                self.model = SwinUNETR(num_heads=heads, use_v2=True, in_channels=in_channels,
+                                       out_channels=out_channels, feature_size=feature_size, depths=depths,
+                                       dropout_path_rate=do_rate, use_checkpoint=True, **swinExtra)
+
+            def forward(self, x):
+                return self.model(x)
+
+        class GCFN(nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.norm = nn.LayerNorm(dim)
+                self.fc1 = nn.Linear(dim, dim)
+                self.fc2 = nn.Linear(dim, dim)
+                self.fc0 = nn.Linear(dim, dim)
+                self.conv1 = nn.Conv3d(dim, dim, kernel_size=5, padding=2, groups=dim)
+                self.conv2 = nn.Conv3d(dim, dim, kernel_size=5, padding=2, groups=dim)
+
+            def forward(self, x):
+                B, C, D, H, W = x.shape
+                x_ = x.permute(0, 2, 3, 4, 1).contiguous().view(B * D * H * W, C)
+                x1 = self.fc1(self.norm(x_)).view(B, D, H, W, C).permute(0, 4, 1, 2, 3)
+                x2 = self.fc2(self.norm(x_)).view(B, D, H, W, C).permute(0, 4, 1, 2, 3)
+                gate = F.gelu(self.conv1(x1)) * self.conv2(x2)
+                gate = gate.permute(0, 2, 3, 4, 1).contiguous().view(B * D * H * W, C)
+                out = self.fc0(gate).view(B, D, H, W, C).permute(0, 4, 1, 2, 3)
+                return out + x
+
+        class SwinGCFN(nn.Module):
+            def __init__(self, in_channels=1, out_channels=1, feature_size=48, heads=(6, 12, 24, 48),
+                         depths=(2, 3, 3, 2), do_rate=0.1):
+                super().__init__()
+                self.model = SwinUNETR(num_heads=heads, use_v2=True, in_channels=in_channels,
+                                       out_channels=out_channels, feature_size=feature_size, depths=depths,
+                                       dropout_path_rate=do_rate, use_checkpoint=True, **swinExtra)
+                self.gcfn = GCFN(dim=out_channels)
+
+            def forward(self, x):
+                return self.gcfn(self.model(x))
+
+        architecture = params["architecture"]
+        if architecture == "UNET":
+            return DenoiseUNet(in_channels=inChannels, channels=params["channels"], num_res_units=params["res_units"],
+                               strides=params["strides"], kernel_size=params["down_kernel"],
+                               up_kernel_size=params["up_kernel"])
+        swinClass = SwinDenoiser if architecture == "SwinUNETR" else SwinGCFN
+        return swinClass(in_channels=inChannels, feature_size=params["feature_size"], heads=params["num_heads"],
+                         depths=params["depths"], do_rate=params["do_rate"])
+
+    def loadModel(self, torch, modelPath, params, inChannels, device):
+        model = self.buildNetwork(params, inChannels).to(device)
+        try:
+            state = torch.load(modelPath, map_location=device, weights_only=True)
+        except TypeError:  # PyTorch older than 1.13 has no weights_only
+            state = torch.load(modelPath, map_location=device)
+        try:
+            model.load_state_dict(state)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"The weights in {os.path.basename(modelPath)} do not match the {params['architecture']} network "
+                "described by its .txt file. Check the parameters in the .txt file.") from error
+        model.eval()
+        return model
+
+    @staticmethod
+    def _addHiddenVolume(name):
+        """Scratch volume: hidden from selectors *before* it enters the scene, never saved."""
+        node = slicer.vtkMRMLScalarVolumeNode()
+        node.SetName(name)
+        node.SetHideFromEditors(True)
+        node.SetSaveWithScene(False)
+        return slicer.mrmlScene.AddNode(node)
+
+    @staticmethod
+    def _runCli(module, parameters, label):
+        cliNode = slicer.cli.createNode(module)
+        try:
+            slicer.cli.runSync(module, cliNode, parameters, update_display=False)
+            if cliNode.GetStatus() & cliNode.ErrorsMask:
+                raise RuntimeError(f"{label} failed: {cliNode.GetErrorText()}")
+        finally:
+            slicer.mrmlScene.RemoveNode(cliNode)
+
+    def resampleToGrid(self, volumeNode, referenceNode):
+        """Voxels of volumeNode on the voxel grid of referenceNode, float32 [k, j, i] (second input channel)."""
+        scratchNode = self._addHiddenVolume("EasyFusionFilterChannel2")
+        try:
+            self._runCli(slicer.modules.brainsresample,
+                         {"inputVolume": volumeNode.GetID(), "referenceVolume": referenceNode.GetID(),
+                          "outputVolume": scratchNode.GetID(), "pixelType": "float", "interpolationMode": "Linear"},
+                         "Resampling the second input")
+            return np.array(slicer.util.arrayFromVolume(scratchNode), dtype=np.float32)
+        finally:
+            slicer.mrmlScene.RemoveNode(scratchNode)
+
+    # --- Crop ("Limit to ROI"), done with Slicer's Crop Volume module ---------
+
+    @staticmethod
+    def findCropRois():
+        return [node for node in slicer.util.getNodesByClass("vtkMRMLMarkupsROINode")
+                if node.GetAttribute(FILTER_CROP_ROI_ATTRIBUTE)]
+
+    @staticmethod
+    def styleCropRoiDisplayNode(displayNode):
+        if displayNode is None:
+            return
+        displayNode.SetSaveWithScene(False)
+        wasModifying = displayNode.StartModify()
+        displayNode.SetSelectedColor(*FILTER_CROP_ROI_COLOR)
+        displayNode.SetColor(*FILTER_CROP_ROI_COLOR)
+        # Resize / move handles only: the box stays aligned with the volume axes, as voxel-based cropping expects
+        for methodName, value in (("SetHandlesInteractive", True), ("SetScaleHandleVisibility", True),
+                                  ("SetTranslationHandleVisibility", True), ("SetRotationHandleVisibility", False),
+                                  ("SetFillOpacity", 0.05), ("SetOutlineOpacity", 1.0)):
+            method = getattr(displayNode, methodName, None)
+            if method is not None:
+                method(value)
+        displayNode.EndModify(wasModifying)
+
+    def createCropRoi(self, volumeNode):
+        """Adjustable crop box fitted to volumeNode with Crop Volume's "Fit to volume". Never saved with the scene."""
+        roiNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", FILTER_CROP_ROI_NAME)
+        roiNode.SetAttribute(FILTER_CROP_ROI_ATTRIBUTE, "1")
+        roiNode.SetSaveWithScene(False)
+        roiNode.CreateDefaultDisplayNodes()
+        self.styleCropRoiDisplayNode(roiNode.GetDisplayNode())
+        parametersNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLCropVolumeParametersNode")
+        try:
+            parametersNode.SetInputVolumeNodeID(volumeNode.GetID())
+            parametersNode.SetROINodeID(roiNode.GetID())
+            slicer.modules.cropvolume.logic().FitROIToInputVolume(parametersNode)
+        finally:
+            slicer.mrmlScene.RemoveNode(parametersNode)
+        return roiNode
+
+    @staticmethod
+    def _hasNonLinearTransform(node):
+        transformNode = node.GetParentTransformNode() if node is not None else None
+        return transformNode is not None and not transformNode.IsTransformToWorldLinear()
+
+    def cropToRoi(self, volumeNode, roiNode):
+        """
+        Voxel-based crop of volumeNode to roiNode: the original voxels inside the ROI are copied, nothing is
+        interpolated or resampled. Returns a new volume (volumeNode is not changed); the caller removes it when done.
+
+        Slicer's Crop Volume is used when it can do the job. It refuses volumes under a non-linear transform (e.g. a CT
+        deformably registered to the PET: "voxel-based cropping of non-linearly transformed input volume is not
+        supported"), and Apply() reports that only through its return code (0 = success). In that case, or if it fails
+        for any other reason, the crop is done here instead (cropVoxelsUnderTransform).
+        """
+        if self._hasNonLinearTransform(volumeNode) or self._hasNonLinearTransform(roiNode):
+            logging.info(f"EasyFusion: '{volumeNode.GetName()}' is under a non-linear transform; "
+                         "cropping it without Crop Volume")
+            return self.cropVoxelsUnderTransform(volumeNode, roiNode)
+
+        scene = slicer.mrmlScene
+        parametersNode = scene.AddNewNodeByClass("vtkMRMLCropVolumeParametersNode")
+        outputNode = None
+        try:
+            parametersNode.SetInputVolumeNodeID(volumeNode.GetID())
+            parametersNode.SetROINodeID(roiNode.GetID())
+            parametersNode.SetVoxelBased(True)
+            parametersNode.SetIsotropicResampling(False)
+            errorCode = slicer.modules.cropvolume.logic().Apply(parametersNode)
+            outputID = parametersNode.GetOutputVolumeNodeID()
+            outputNode = scene.GetNodeByID(outputID) if outputID else None
+        finally:
+            scene.RemoveNode(parametersNode)
+        if errorCode == 0 and outputNode is not None and outputNode.GetImageData() is not None:
+            return outputNode
+
+        logging.warning(f"EasyFusion: Crop Volume failed on '{volumeNode.GetName()}' (error code {errorCode}); "
+                        "cropping it without Crop Volume")
+        if outputNode is not None and outputNode is not volumeNode and scene.IsNodePresent(outputNode):
+            scene.RemoveNode(outputNode)  # empty / half-made output of the failed Crop Volume run
+        return self.cropVoxelsUnderTransform(volumeNode, roiNode)
+
+    def cropVoxelsUnderTransform(self, volumeNode, roiNode):
+        """
+        Voxel-based crop that works whatever transforms volumeNode and roiNode are under, linear or not.
+        The ROI box is mapped into the volume's own (untransformed) coordinates through the transforms between the two
+        nodes, and the block of original voxels covering it is copied into a new volume that keeps volumeNode's voxel
+        grid and parent transform. Under a deformable transform the box is warped in the volume's coordinates, so the
+        block is its bounding box there: it covers the whole ROI and, near the edges, slightly more.
+        """
+        imageData = volumeNode.GetImageData()
+        if imageData is None:
+            raise RuntimeError(f"'{volumeNode.GetName()}' has no image data.")
+
+        # ROI surface: object coordinates -> ROI node coordinates -> volume node coordinates -> volume IJK
+        objectToNode = roiNode.GetObjectToNodeMatrix()
+        roiToVolume = vtk.vtkGeneralTransform()
+        slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
+            roiNode.GetParentTransformNode(), volumeNode.GetParentTransformNode(), roiToVolume)
+        rasToIjk = vtk.vtkMatrix4x4()
+        volumeNode.GetRASToIJKMatrix(rasToIjk)
+        ijkPoints = []
+        for point in boxSurfacePoints(roiNode.GetSize()):
+            inRoiNode = objectToNode.MultiplyPoint([float(point[0]), float(point[1]), float(point[2]), 1.0])[:3]
+            inVolumeNode = roiToVolume.TransformPoint(inRoiNode)
+            ijkPoints.append(rasToIjk.MultiplyPoint(list(inVolumeNode) + [1.0])[:3])
+
+        # One extra voxel all round: the warped box between the sampled points may bulge a little further
+        margin = 1 if self._hasNonLinearTransform(volumeNode) or self._hasNonLinearTransform(roiNode) else 0
+        block = voxelBlockFromIjkPoints(ijkPoints, imageData.GetDimensions(), margin=margin)
+        if block is None:
+            raise RuntimeError(f"The crop ROI does not overlap '{volumeNode.GetName()}'. Move the box onto the volume.")
+        (i0, j0, k0), (i1, j1, k1) = block
+        croppedArray = np.array(slicer.util.arrayFromVolume(volumeNode)[k0:k1, j0:j1, i0:i1])  # copy
+
+        croppedNode = self._addHiddenVolume(f"{volumeNode.GetName()}_cropped")
+        try:
+            ijkToRas = vtk.vtkMatrix4x4()
+            volumeNode.GetIJKToRASMatrix(ijkToRas)
+            croppedNode.SetIJKToRASMatrix(ijkToRas)  # same spacing and axes as the original
+            croppedNode.SetOrigin(ijkToRas.MultiplyPoint([float(i0), float(j0), float(k0), 1.0])[:3])
+            slicer.util.updateVolumeFromArray(croppedNode, croppedArray)
+            # Same local coordinates as the original, so it belongs under the same transform (as Crop Volume does)
+            croppedNode.SetAndObserveTransformNodeID(volumeNode.GetTransformNodeID())
+        except Exception:
+            slicer.mrmlScene.RemoveNode(croppedNode)
+            raise
+        return croppedNode
+
+    @staticmethod
+    def _recordProvenance(outputNode, sourceNode, modelPath):
+        outputNode.SetAttribute(FILTER_MODEL_ATTRIBUTE, os.path.basename(modelPath))
+        outputNode.SetAttribute(FILTER_DATE_ATTRIBUTE, time.strftime("%Y-%m-%d %H:%M:%S"))
+        outputNode.SetNodeReferenceID(FILTER_SOURCE_ROLE, sourceNode.GetID())
+        # Same quantity and units as the source (e.g. SUVbw, g/ml), so the Data Probe labels values the same way
+        for getterName, setterName in (("GetVoxelValueQuantity", "SetVoxelValueQuantity"),
+                                       ("GetVoxelValueUnits", "SetVoxelValueUnits")):
+            try:
+                entry = getattr(sourceNode, getterName)()
+                if entry is not None:
+                    copied = slicer.vtkCodedEntry()
+                    copied.Copy(entry)
+                    getattr(outputNode, setterName)(copied)
+            except Exception:
+                logging.debug(f"EasyFusion: could not copy {getterName} to the filtered volume", exc_info=True)
+        # Next to the source in the Data module tree (same patient / study)
+        try:
+            shNode = slicer.mrmlScene.GetSubjectHierarchyNode()
+            parentItem = shNode.GetItemParent(shNode.GetItemByDataNode(sourceNode))
+            outputItem = shNode.GetItemByDataNode(outputNode)
+            if parentItem and outputItem:
+                shNode.SetItemParent(outputItem, parentItem)
+        except Exception:
+            logging.debug("EasyFusion: could not place the filtered volume in the subject hierarchy", exc_info=True)
+
+    def run(self, sourceNode, secondNode, modelPath, params, outputName, forceCPU=False, report=None,
+            originalNode=None):
+        """
+        Filter sourceNode into a NEW volume called outputName. sourceNode is only read, never modified.
+        originalNode: the volume the user selected, when sourceNode is a cropped copy of it ("Limit to ROI");
+        the result is tagged with it and placed under its transform.
+        secondNode: second input channel of dual-channel models (else None).
+        report(text, done=0, total=0): progress callback; it may raise FilterCancelled to stop the run.
+        The output volume is added to the scene only once everything worked, so a failed or cancelled run
+        leaves nothing behind. Returns (outputNode, device description, seconds).
+        """
+        import torch
+        from monai.inferers import sliding_window_inference
+
+        report = report or (lambda text, done=0, total=0: None)
+        originalNode = originalNode or sourceNode
+        startTime = time.time()
+        scene = slicer.mrmlScene
+        scratchNode = None
+        model = None
+        try:
+            report("Loading the model…")
+            device, deviceText = self.chooseDevice(torch, forceCPU)
+            model = self.loadModel(torch, modelPath, params, 2 if params["dual_channel"] else 1, device)
+
+            # Input on the model's voxel grid. The volume in the scene is never written to: resampling goes into a
+            # scratch volume, and without resampling the voxels are copied out before anything else happens.
+            if params["dont_resample"]:
+                gridNode = sourceNode
+            else:
+                spacing = params["voxel_spacing"]
+                report(f"Resampling to {' × '.join(f'{v:g}' for v in spacing)} mm voxels…")
+                scratchNode = self._addHiddenVolume("EasyFusionFilterInput")
+                self._runCli(slicer.modules.resamplescalarvolume,
+                             {"InputVolume": sourceNode.GetID(), "OutputVolume": scratchNode.GetID(),
+                              "outputPixelSpacing": ",".join(f"{float(v):g}" for v in spacing),
+                              "interpolationType": "linear"},
+                             "Resampling")
+                gridNode = scratchNode
+            gridArray = slicer.util.arrayFromVolume(gridNode)
+            inputDtype = gridArray.dtype
+            inputTensor = torch.from_numpy(np.array(gridArray, dtype=np.float32))[None, None]  # (1, 1, K, J, I)
+            del gridArray
+            networkInput = inputTensor
+            if params["dual_channel"]:
+                report("Resampling the second input…")
+                secondTensor = torch.from_numpy(self.resampleToGrid(secondNode, gridNode))[None, None]
+                networkInput = torch.cat([inputTensor, secondTensor], dim=1)
+                del secondTensor
+
+            # Windows run on the chosen device; the whole volume and the blending buffers stay in RAM
+            roiSize = tuple(params["block_size"])
+            total = estimateSlidingWindowCount(inputTensor.shape[2:], roiSize)
+            label = f"Filtering on {deviceText}…"
+            done = [0]
+
+            def predictor(window, *args, **kwargs):
+                report(label, done[0], total)
+                prediction = model(window, *args, **kwargs)
+                done[0] += 1
+                return prediction
+
+            report(label, 0, total)
+            with torch.no_grad():
+                predictedNoise = sliding_window_inference(
+                    inputs=networkInput, roi_size=roiSize, sw_batch_size=1, predictor=predictor,
+                    overlap=FILTER_WINDOW_OVERLAP, mode="gaussian", sw_device=device, device=torch.device("cpu"))
+            report(label, total, total)
+            del networkInput
+
+            # The networks predict the noise: filtered image = input - predicted noise (as in PETDenoise)
+            result = (inputTensor - predictedNoise.to(inputTensor.dtype))[0, 0].cpu().numpy()
+            del predictedNoise, inputTensor
+            if params["prevent_negative"]:
+                result = np.clip(result, 0, None)
+            result = castFilterResult(result, inputDtype)
+
+            report("Creating the filtered volume…")
+            outputNode = scene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", outputName)
+            outputNode.CopyOrientation(gridNode)
+            slicer.util.updateVolumeFromArray(outputNode, result)
+            # Same local coordinates as the original, so it belongs under the same (e.g. registration) transform
+            outputNode.SetAndObserveTransformNodeID(originalNode.GetTransformNodeID())
+            outputNode.CreateDefaultDisplayNodes()
+            self._recordProvenance(outputNode, originalNode, modelPath)
+            if originalNode is not sourceNode:
+                outputNode.SetAttribute(FILTER_CROPPED_ATTRIBUTE, "1")
+            return outputNode, deviceText, time.time() - startTime
+        finally:
+            if scratchNode is not None and scene.IsNodePresent(scratchNode):
+                scene.RemoveNode(scratchNode)
+            model = None
+            gc.collect()
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
