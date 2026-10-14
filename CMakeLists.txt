@@ -8,7 +8,7 @@ set(EXTENSION_HOMEPAGE "https://github.com/4burakfe/SlicerPETDenoise/")
 set(EXTENSION_CATEGORY "Nuclear Medicine")
 set(EXTENSION_CONTRIBUTORS "Burak Demir")
 set(EXTENSION_DESCRIPTION "SlicerPETDenoise is a 3D Slicer extension that includes two modules intended for medical image research, particularly PET and CT image workflows: AI-based PET denoising and numerical comparison of volumes. The tools are developed with research utility in mind and are not intended for clinical use. The SPECT/PET review module (Epona) has moved to the PETReviewCompare extension.")
-set(EXTENSION_ICONURL "https://raw.githubusercontent.com/4burakfe/SlicerPETDenoise/ed0f24892556718d029948076f1e4e8fae46c261/SlicerPETDenoise.png")
+set(EXTENSION_ICONURL "https://raw.githubusercontent.com/4burakfe/SlicerPETDenoise/refs/heads/main/PETDenoise/Resources/logo.png")
 set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/4burakfe/SlicerPETDenoise/ed0f24892556718d029948076f1e4e8fae46c261/scr1.jpg")
 set(EXTENSION_DEPENDS "PyTorch") # Specified as a list or "NA" if no dependencies
 
