@@ -1,7 +1,7 @@
 # SlicerPETDenoise Extension for 3D Slicer
 
 **Author**: Burak Demir, MD, FEBNM  
-**Module versions**: Belenos – PET Denoise v1.1 · Belenos – Volume Comparator v1.2  
+**Module versions**: Belenos – PET Denoise v1.2 · Belenos – Volume Comparator v1.2  
 **Contact**: 4burakfe@gmail.com
 
 ## Overview
@@ -51,6 +51,7 @@ Performs AI-based denoising of PET volumes using deep learning models. Supports 
 - Sliding window inference with configurable block size
 - "Prevent Negative Values" option
 - CUDA acceleration when a GPU with enough memory is available, with a **FORCE CPU** option
+- Published models can be downloaded from GitHub inside the module (**Download Published Models**)
 - The model folder is remembered between sessions
 - The input volume is never modified; output names are made unique so earlier results are not overwritten
 
@@ -58,6 +59,7 @@ Performs AI-based denoising of PET volumes using deep learning models. Supports 
 1. Select the input PET volume.
 2. (Optional) Select the corresponding CT volume and tick **Dual Volume Input** for dual-channel models.
 3. Click **Select Model Folder** and pick a folder containing `.pth` models with their `.txt` files.
+   Or open **Download Published Models**, pick a model and click **Download**: the `.pth` and its `.txt` are downloaded from GitHub into the model folder and the model is selected. Without a model folder, they go into Slicer's cache folder (`BelenosModels`), which becomes the model folder. **Check for New Models** reads the release list again (otherwise it is checked at most once a day). Models already downloaded by Epona – SPECT/PET Review are copied instead of downloaded again.
 4. Choose a model. Its settings are read from the `.txt` file; check or adjust architecture, voxel spacing and block size if needed.
 5. Click **Denoise**. The output is a new volume named like `OriginalName_DN_ModelName`.
 
