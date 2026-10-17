@@ -7,6 +7,10 @@ import logging
 import importlib
 import traceback
 import configparser
+import json
+import shutil
+import hashlib
+import urllib.request
 
 import numpy as np
 import qt
@@ -14,7 +18,7 @@ import ctk
 import slicer
 from slicer.ScriptedLoadableModule import *
 
-MODULE_VERSION = "v1.1"
+MODULE_VERSION = "v1.2"
 ARCHITECTURES = ("UNET", "SwinUNETR", "SwinUNETR+GCFN")
 WINDOW_OVERLAP = 0.25
 MIN_VRAM_GB = 1.9
@@ -22,6 +26,34 @@ EINOPS_REQUIREMENT = "einops==0.6.1"
 SETTINGS_MODEL_FOLDER = "PETDenoise/ModelFolder"
 MODEL_ATTRIBUTE = "PETDenoise.Model"
 DATE_ATTRIBUTE = "PETDenoise.Date"
+
+# Published models (GitHub releases of this repository): <name>.pth + <name>.txt. The release lists and the
+# download cache folder are the same as in Epona - SPECT/PET Review (PETReviewCompare extension), so a model
+# downloaded by one module is found by the other.
+MODEL_REPOSITORY = "4burakfe/SlicerPETDenoise"
+MODEL_RELEASES = (("Models", "Denoising"), ("SuperRes_Models", "Super-resolution"))  # (release tag, kind)
+MODEL_RELEASE_PAGE_URL = "https://github.com/{repository}/releases/tag/{tag}"
+MODEL_DOWNLOAD_URL = "https://github.com/{repository}/releases/download/{tag}/{name}"
+MODEL_RELEASE_API_URL = "https://api.github.com/repos/{repository}/releases/tags/{tag}"
+MODEL_CACHE_FOLDER_NAME = "BelenosModels"  # inside Slicer's cache folder; also used when no model folder is set
+MODEL_CATALOG_FILE = "catalog.json"  # release asset lists from the last successful check
+MODEL_CATALOG_MAX_AGE_S = 24 * 3600  # GitHub is asked for new / replaced models at most once a day
+NETWORK_TIMEOUT_S = 8
+DOWNLOAD_CHUNK_BYTES = 1 << 20
+# Models published when this version was released: (file, release tag, size in bytes, SHA-256 of the file).
+# Used as they are when GitHub cannot be reached; the release lists on GitHub add new and replaced models.
+PUBLISHED_MODELS = (
+    ("pet_denoiser_std_char.pth", "Models", 80995179,
+     "11e4627577c2ed8c0f19616dd004c63ee00c321febb85f54158bb88c485881e8"),
+    ("pet_denoiser_x14w3.pth", "Models", 80994666,
+     "dbd53df5765e48c61320b39737dbf5b73973b0f2b53a7f8ec3d2541947088a53"),
+    ("pet_denoiser_x19w1_5.pth", "Models", 80994666,
+     "dd05fb82873bd579ebe8785f50371579e930d2b771e2385947ca1ada46f7c60f"),
+    ("PET_superres12.pth", "SuperRes_Models", 26564203,
+     "af17bf85515ac4b64404e40fda0290506673fc951a0bfe71c9672a372b6d6d77"),
+    ("CT_superres24.pth", "SuperRes_Models", 80994495,
+     "51a8ce1b383f3803bdace09f4a6e5e9ee63e8c51b48ef6476b8cac477763bb87"),
+)
 
 # Panel defaults. Applied before every sidecar (.txt), so a key missing from one model's sidecar never
 # silently inherits the value left over from the previously selected model.
@@ -154,6 +186,86 @@ def isOutOfMemory(error):
     return "out of memory" in text or "can't allocate memory" in text or "not enough memory" in text
 
 
+class DownloadCancelled(Exception):
+    """Raised by the progress callback of a download when the user pressed Cancel."""
+
+
+def sidecarName(modelName):
+    """<model>.txt for <model>.pth."""
+    return os.path.splitext(modelName)[0] + ".txt"
+
+
+def formatByteSize(numberOfBytes):
+    gigabytes = numberOfBytes / 1024.0 ** 3
+    return f"{gigabytes:.1f} GB" if gigabytes >= 1.0 else f"{numberOfBytes / 1024.0 ** 2:.0f} MB"
+
+
+def releaseAssetUrl(tag, name):
+    return MODEL_DOWNLOAD_URL.format(repository=MODEL_REPOSITORY, tag=tag, name=name)
+
+
+def parseReleaseAssets(release):
+    """Asset list of a GitHub release (API JSON) as [{"name", "size", "sha256", "url"}]; sha256 None if unknown."""
+    assets = []
+    for asset in (release or {}).get("assets") or []:
+        name = str(asset.get("name") or "")
+        if not name:
+            continue
+        digest = str(asset.get("digest") or "")
+        assets.append({
+            "name": name,
+            "size": int(asset.get("size") or 0) or None,
+            "sha256": digest[len("sha256:"):].lower() if digest.lower().startswith("sha256:") else None,
+            "url": str(asset.get("browser_download_url") or "") or None,
+        })
+    return assets
+
+
+def mergePublishedModelCatalog(releaseAssets=None):
+    """
+    Published models as {file name: entry}, entry = name, tag, kind, size, sha256, url, sidecarUrl.
+    releaseAssets: {release tag: parseReleaseAssets(...)} from GitHub (or its saved copy); None / {} gives the
+    built-in list. For every release that was read, its asset list is what counts: added models appear, removed
+    ones disappear, and a model whose size changed was replaced, so the built-in checksum is dropped.
+    """
+    kinds = dict(MODEL_RELEASES)
+    models = {}
+    for name, tag, size, sha256 in PUBLISHED_MODELS:
+        models[name] = {"name": name, "tag": tag, "kind": kinds.get(tag, ""), "size": size, "sha256": sha256,
+                        "url": releaseAssetUrl(tag, name), "sidecarUrl": releaseAssetUrl(tag, sidecarName(name))}
+    for tag, assets in (releaseAssets or {}).items():
+        if tag not in kinds:
+            continue
+        names = {asset["name"] for asset in assets}
+        for name in [name for name, entry in models.items() if entry["tag"] == tag and name not in names]:
+            del models[name]
+        for asset in assets:
+            name = asset["name"]
+            if not name.lower().endswith(".pth"):
+                continue
+            entry = models.get(name)
+            if entry is None or entry["tag"] != tag:
+                entry = {"name": name, "tag": tag, "kind": kinds[tag], "size": None, "sha256": None}
+                models[name] = entry
+            elif asset["size"] and asset["size"] != entry["size"]:
+                entry["sha256"] = None  # replaced on GitHub: the built-in checksum is for the old file
+            entry["size"] = asset["size"] or entry["size"]
+            entry["sha256"] = asset["sha256"] or entry["sha256"]
+            entry["url"] = asset["url"] or releaseAssetUrl(tag, name)
+            sidecar = sidecarName(name)
+            entry["sidecarUrl"] = releaseAssetUrl(tag, sidecar) if sidecar in names else None
+    tagOrder = {tag: index for index, (tag, _) in enumerate(MODEL_RELEASES)}
+    return dict(sorted(models.items(), key=lambda item: (tagOrder.get(item[1]["tag"], 99), item[0].lower())))
+
+
+def isCompleteModelFile(path, expectedSize):
+    """True if the file exists and (when the published size is known) has exactly that size."""
+    try:
+        return os.path.isfile(path) and (not expectedSize or os.path.getsize(path) == expectedSize)
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Module
 # ---------------------------------------------------------------------------
@@ -210,6 +322,7 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
         formLayout.addRow("Model Folder:", self.modelFolderPathEdit)
         self.selectFolderButton = qt.QPushButton("Select Model Folder")
         formLayout.addRow(self.selectFolderButton)
+        self.setupDownloadSection(formLayout)
 
         self.modelselector = qt.QComboBox()
         formLayout.addRow("Select Model: ", self.modelselector)
@@ -286,6 +399,9 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
         self._unetWidgets = [self.strideComboBox, self.channels, self.resUnitSpinBox,
                              self.downkernelSpinBox, self.upkernelSpinBox]
         self._swinWidgets = [self.heads, self.depths, self.swinfeaturesize, self.dropoutrate]
+        # Disabled while a denoising run or a download is going on
+        self._busyWidgets = [self.calculateButton, self.selectFolderButton, self.modelselector,
+                             self.downloadModelButton, self.checkModelsButton]
 
         self.loadModelFolderPath()
         self.selectFolderButton.connect("clicked(bool)", self.selectModelFolder)
@@ -294,6 +410,10 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
         self.architecture.connect("currentIndexChanged(int)", self.updateEnabledState)
         self.dualch_cbox.connect("toggled(bool)", self.updateEnabledState)
         self.dont_resample_cbox.connect("toggled(bool)", self.updateEnabledState)
+        self.downloadCollapsibleButton.connect("contentsCollapsed(bool)", self.onDownloadSectionCollapsed)
+        self.publishedModelSelector.connect("currentIndexChanged(int)", self.updateDownloadButton)
+        self.downloadModelButton.connect("clicked(bool)", self.onDownloadModelClicked)
+        self.checkModelsButton.connect("clicked(bool)", lambda: self.updatePublishedModelCatalog(force=True))
         self.updateModelInfoBox()
 
     @staticmethod
@@ -440,9 +560,7 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
         modelPath = os.path.join(self.modelFolderPathEdit.text, modelName)
         outputName = self.logic.uniqueVolumeName(f"{petNode.GetName()}_DN_{os.path.splitext(modelName)[0]}")
 
-        self._running = True
-        for widget in (self.calculateButton, self.selectFolderButton, self.modelselector):
-            widget.enabled = False
+        self.setBusy(True)
         qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
         try:
             self.log("🚀 Starting AI denoising process...")
@@ -459,9 +577,14 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
             slicer.util.errorDisplay(f"Denoising failed:\n{error}", detailedText=traceback.format_exc())
         finally:
             qt.QApplication.restoreOverrideCursor()
-            for widget in (self.calculateButton, self.selectFolderButton, self.modelselector):
-                widget.enabled = True
-            self._running = False
+            self.setBusy(False)
+
+    def setBusy(self, busy):
+        self._running = busy
+        for widget in self._busyWidgets:
+            widget.enabled = not busy
+        if not busy:
+            self.updateDownloadButton()
 
     @staticmethod
     def ensureDependencies():
@@ -548,6 +671,7 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
             self.refreshModelSelector(folder)
 
     def refreshModelSelector(self, folder):
+        self.refreshPublishedModelSelector()
         self.modelselector.clear()
         try:
             models = sorted(f for f in os.listdir(folder) if f.lower().endswith(".pth"))
@@ -556,7 +680,203 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
             return
         self.modelselector.addItems(models)
         if not models:
-            self.modelInfoBox.setPlainText("No .pth models found in this folder.")
+            self.modelInfoBox.setPlainText("No .pth models found in this folder. Published models can be "
+                                           "downloaded in the 'Download Published Models' section.")
+
+    # --- Published models (download from GitHub) ----------------------------
+    # Downloaded into the model folder, so they are used like any other model there (and Epona - SPECT/PET
+    # Review finds them in that folder too). Without a model folder, Slicer's cache folder shared with Epona is
+    # used and becomes the model folder. A model Epona already downloaded there is copied instead of downloaded.
+
+    def setupDownloadSection(self, formLayout):
+        self.downloadCollapsibleButton = ctk.ctkCollapsibleButton()
+        self.downloadCollapsibleButton.text = "Download Published Models"
+        self.downloadCollapsibleButton.collapsed = True
+        formLayout.addRow(self.downloadCollapsibleButton)
+        downloadLayout = qt.QFormLayout(self.downloadCollapsibleButton)
+
+        self.publishedModelSelector = qt.QComboBox()
+        self.publishedModelSelector.setToolTip("Models published on GitHub with this extension.")
+        downloadLayout.addRow("Published Model:", self.publishedModelSelector)
+        buttonsLayout = qt.QHBoxLayout()
+        self.downloadModelButton = qt.QPushButton("Download")
+        self.downloadModelButton.setToolTip("Download the model and its .txt file into the model folder, "
+                                            "then select it.")
+        buttonsLayout.addWidget(self.downloadModelButton)
+        self.checkModelsButton = qt.QPushButton("Check for New Models")
+        self.checkModelsButton.setToolTip("Read the list of published models from GitHub now.")
+        buttonsLayout.addWidget(self.checkModelsButton)
+        downloadLayout.addRow(buttonsLayout)
+        self.downloadStatusLabel = qt.QLabel("")
+        self.downloadStatusLabel.wordWrap = True
+        downloadLayout.addRow(self.downloadStatusLabel)
+
+        releases, self._modelCatalogChecked = self.logic.readSavedModelCatalog()
+        self._publishedModels = mergePublishedModelCatalog(releases)
+        self.refreshPublishedModelSelector()
+
+    def downloadTargetFolder(self):
+        folder = self.modelFolderPathEdit.text
+        return folder if folder and os.path.isdir(folder) else self.logic.publishedModelFolder()
+
+    def currentPublishedModel(self):
+        name = self.publishedModelSelector.itemData(self.publishedModelSelector.currentIndex)
+        return self._publishedModels.get(name) if name else None
+
+    def refreshPublishedModelSelector(self):
+        folder = self.downloadTargetFolder()
+        previousName = self.publishedModelSelector.itemData(self.publishedModelSelector.currentIndex)
+        wasBlocked = self.publishedModelSelector.blockSignals(True)
+        self.publishedModelSelector.clear()
+        for name, entry in self._publishedModels.items():
+            present = isCompleteModelFile(os.path.join(folder, name), entry["size"])
+            details = [entry["kind"]] if entry["kind"] else []
+            if entry["size"]:
+                details.append(formatByteSize(entry["size"]))
+            if present:
+                details.append("in model folder")
+            label = os.path.splitext(name)[0] + (f"  ({', '.join(details)})" if details else "")
+            self.publishedModelSelector.addItem(label, name)
+            tip = (f"{entry['kind']} model published on GitHub ({entry['tag']}), "
+                   f"{'already in the model folder' if present else 'not downloaded yet'}.")
+            self.publishedModelSelector.setItemData(self.publishedModelSelector.count - 1, tip, qt.Qt.ToolTipRole)
+        index = self.publishedModelSelector.findData(previousName) if previousName else -1
+        self.publishedModelSelector.setCurrentIndex(index if index >= 0 else (0 if self._publishedModels else -1))
+        self.publishedModelSelector.blockSignals(wasBlocked)
+        self.updateDownloadButton()
+
+    def updateDownloadButton(self, *args):
+        entry = self.currentPublishedModel()
+        present = entry is not None and isCompleteModelFile(
+            os.path.join(self.downloadTargetFolder(), entry["name"]), entry["size"])
+        self.downloadModelButton.text = "Select" if present else "Download"
+        self.downloadModelButton.enabled = entry is not None and not self._running
+
+    def onDownloadSectionCollapsed(self, collapsed):
+        """Opening the section: check GitHub for new published models (at most once a day)."""
+        if not collapsed:
+            self.updatePublishedModelCatalog(force=False)
+
+    def updatePublishedModelCatalog(self, force=False):
+        """Read the release lists from GitHub (force: now; else if the last check is over a day old)."""
+        if self._running:
+            return
+        failure = None
+        if force or time.time() - self._modelCatalogChecked > MODEL_CATALOG_MAX_AGE_S:
+            self.downloadStatusLabel.text = "Checking GitHub for published models…"
+            slicer.app.processEvents()
+            qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+            try:
+                self._publishedModels = mergePublishedModelCatalog(self.logic.fetchModelCatalog())
+                self.downloadStatusLabel.text = f"{len(self._publishedModels)} published models."
+            except Exception as error:
+                logging.warning(f"PETDenoise: could not read the list of published models from GitHub: {error}")
+                failure = error
+                self.downloadStatusLabel.text = "GitHub could not be reached; the models already known are listed."
+            finally:
+                self._modelCatalogChecked = time.time()  # offline: do not try again on every opening
+                qt.QApplication.restoreOverrideCursor()
+        self.refreshPublishedModelSelector()
+        if failure is not None and force:
+            slicer.util.warningDisplay("Could not reach GitHub to check for new models:\n"
+                                       f"{failure}\n\nThe models already known are still listed.")
+
+    def onDownloadModelClicked(self):
+        entry = self.currentPublishedModel()
+        if entry is None or self._running:
+            return
+        folder = self.downloadTargetFolder()
+        if isCompleteModelFile(os.path.join(folder, entry["name"]), entry["size"]):
+            if not os.path.isfile(os.path.join(folder, sidecarName(entry["name"]))):
+                self.fetchSidecar(entry, folder, cachedFirst=True)
+        elif not self.downloadModel(entry, folder):
+            return
+        if self.modelFolderPathEdit.text != folder:
+            self.modelFolderPathEdit.setText(folder)
+            self.saveModelFolderPath(folder)
+        self.refreshModelSelector(folder)
+        index = self.modelselector.findText(entry["name"])
+        if index >= 0:
+            self.modelselector.setCurrentIndex(index)
+        self.updateModelInfoBox()
+
+    def fetchSidecar(self, entry, folder, cachedFirst):
+        """The model's .txt into folder (copied from the shared cache folder if cachedFirst). Never fatal."""
+        qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+        try:
+            self.logic.fetchSidecar(entry, folder, cachedFirst)
+        except Exception as error:
+            logging.warning(f"PETDenoise: could not download the description of {entry['name']}: {error}")
+            self.downloadStatusLabel.text = (f"The description file (.txt) of {entry['name']} could not be "
+                                             "downloaded; check the parameters before denoising.")
+        finally:
+            qt.QApplication.restoreOverrideCursor()
+
+    def downloadModel(self, entry, folder):
+        """Download a published model (and its .txt) behind a cancellable progress dialog. True when done."""
+        name = entry["name"]
+        self.setBusy(True)
+        progress = DownloadProgressDialog(f"Belenos - downloading {name}")
+        failure = None
+        try:
+            copied = self.logic.downloadModel(entry, folder, report=progress)
+            self.downloadStatusLabel.text = f"{'Copied' if copied else 'Downloaded'} {name} into {folder}."
+        except DownloadCancelled:
+            self.downloadStatusLabel.text = "Download cancelled."
+            return False
+        except Exception as error:
+            logging.exception(f"PETDenoise: could not download {name}")
+            failure = (error, traceback.format_exc())
+        finally:
+            progress.close()
+            self.setBusy(False)
+        if failure is not None:
+            releasePage = MODEL_RELEASE_PAGE_URL.format(repository=MODEL_REPOSITORY, tag=entry["tag"])
+            self.downloadStatusLabel.text = f"Could not download {name}."
+            slicer.util.errorDisplay(
+                f"Could not download {name} into\n{folder}:\n{failure[0]}\n\n"
+                f"Check the internet connection and that the folder is writable, then try again. You can also "
+                f"download the .pth and .txt files yourself from\n{releasePage}\ninto the model folder.",
+                detailedText=failure[1])
+            return False
+        self.fetchSidecar(entry, folder, cachedFirst=copied)
+        return True
+
+
+class DownloadProgressDialog:
+    """Modal progress window of a download. Calling it updates the text / bar; after Cancel it raises."""
+
+    def __init__(self, title):
+        dialog = qt.QProgressDialog(slicer.util.mainWindow())
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(qt.Qt.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumWidth(420)
+        dialog.setRange(0, 0)
+        dialog.setLabelText("Preparing…")
+        dialog.show()
+        self.dialog = dialog
+        slicer.app.processEvents()
+
+    def __call__(self, text, done=0, total=0, detail=None):
+        if self.dialog.wasCanceled:
+            raise DownloadCancelled()
+        if total > 0:
+            self.dialog.setLabelText(f"{text}\n{detail}" if detail else text)
+            self.dialog.setRange(0, int(total))
+            self.dialog.setValue(min(int(done), int(total)))
+        else:
+            self.dialog.setLabelText(f"{text}\n{detail}" if detail else text)
+            self.dialog.setRange(0, 0)
+        slicer.app.processEvents()
+        if self.dialog.wasCanceled:
+            raise DownloadCancelled()
+
+    def close(self):
+        self.dialog.close()
+        self.dialog.deleteLater()
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +897,149 @@ class PETDenoiseLogic(ScriptedLoadableModuleLogic):
             name = f"{baseName}_{number}"
             number += 1
         return name
+
+    # --- Published models --------------------------------------------------
+
+    @staticmethod
+    def publishedModelFolder():
+        """Download cache shared with Epona - SPECT/PET Review: Slicer's cache folder (kept across updates)."""
+        return os.path.join(slicer.app.cachePath, MODEL_CACHE_FOLDER_NAME)
+
+    @classmethod
+    def readSavedModelCatalog(cls):
+        """(release assets, time of that check) saved by the last successful check of GitHub; ({}, 0) if none."""
+        try:
+            with open(os.path.join(cls.publishedModelFolder(), MODEL_CATALOG_FILE), "r",
+                      encoding="utf-8") as catalogFile:
+                saved = json.load(catalogFile)
+            releases = {str(tag): [dict(asset) for asset in assets]
+                        for tag, assets in (saved.get("releases") or {}).items()}
+            for assets in releases.values():
+                for asset in assets:
+                    if not asset.get("name"):
+                        raise ValueError("asset without a name")
+                    asset.setdefault("size", None)
+                    asset.setdefault("sha256", None)
+                    asset.setdefault("url", None)
+            return releases, float(saved.get("checked") or 0)
+        except FileNotFoundError:
+            return {}, 0.0
+        except (OSError, ValueError, TypeError, AttributeError):
+            logging.warning("PETDenoise: ignored an unreadable saved model list", exc_info=True)
+            return {}, 0.0
+
+    @staticmethod
+    def openUrl(url, timeout=NETWORK_TIMEOUT_S, accept=None):
+        headers = {"User-Agent": "3DSlicer-PETDenoise"}
+        if accept:
+            headers["Accept"] = accept
+        return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+
+    @classmethod
+    def fetchModelCatalog(cls):
+        """Asset lists of the model releases from the GitHub API, saved for later sessions. Raises if offline."""
+        releases = {}
+        for tag, _ in MODEL_RELEASES:
+            url = MODEL_RELEASE_API_URL.format(repository=MODEL_REPOSITORY, tag=tag)
+            with cls.openUrl(url, accept="application/vnd.github+json") as response:
+                releases[tag] = parseReleaseAssets(json.loads(response.read().decode("utf-8")))
+        folder = cls.publishedModelFolder()
+        try:
+            os.makedirs(folder, exist_ok=True)
+            catalogPath = os.path.join(folder, MODEL_CATALOG_FILE)
+            with open(catalogPath + ".part", "w", encoding="utf-8") as catalogFile:
+                json.dump({"checked": time.time(), "releases": releases}, catalogFile, indent=1)
+            os.replace(catalogPath + ".part", catalogPath)
+        except OSError:
+            logging.warning("PETDenoise: could not save the model list", exc_info=True)
+        return releases
+
+    @staticmethod
+    def _removePartFile(partPath):
+        if os.path.exists(partPath):
+            try:
+                os.remove(partPath)
+            except OSError:
+                logging.warning(f"PETDenoise: could not remove {partPath}")
+
+    @classmethod
+    def downloadFile(cls, url, destination, expectedSize=None, sha256=None, report=None, text="Downloading…"):
+        """
+        Download url to destination through destination + ".part", which is renamed only once the size and (when
+        known) the SHA-256 checksum match, so an interrupted or corrupted download never looks like a model.
+        report(text, done, total, detail) is the progress callback; it raises DownloadCancelled to stop.
+        """
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        partPath = destination + ".part"
+        hasher = hashlib.sha256()
+        done = 0
+        try:
+            with cls.openUrl(url, timeout=30) as response, open(partPath, "wb") as output:
+                total = int(response.headers.get("Content-Length") or 0) or int(expectedSize or 0)
+                while True:
+                    if report is not None:
+                        detail = f"{done / 1e6:.0f} of {total / 1e6:.0f} MB" if total else f"{done / 1e6:.0f} MB"
+                        report(text, done, total, detail)
+                    chunk = response.read(DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    hasher.update(chunk)
+                    done += len(chunk)
+            if expectedSize and done != expectedSize:
+                raise OSError(f"incomplete download: {done} of {expectedSize} bytes received")
+            if sha256 and hasher.hexdigest() != sha256.lower():
+                raise OSError("the downloaded file is corrupted (SHA-256 checksum does not match)")
+            os.replace(partPath, destination)
+        finally:
+            cls._removePartFile(partPath)
+        return destination
+
+    @classmethod
+    def copyFile(cls, source, destination):
+        """Copy through destination + ".part", so an interrupted copy never looks like a model."""
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        partPath = destination + ".part"
+        try:
+            shutil.copyfile(source, partPath)
+            os.replace(partPath, destination)
+        finally:
+            cls._removePartFile(partPath)
+        return destination
+
+    @staticmethod
+    def _sameFolder(a, b):
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+    @classmethod
+    def downloadModel(cls, entry, folder, report=None):
+        """
+        Published model's .pth into folder: copied from the shared cache folder when it is complete there,
+        otherwise downloaded from GitHub. True if it was copied.
+        """
+        name = entry["name"]
+        destination = os.path.join(folder, name)
+        cached = os.path.join(cls.publishedModelFolder(), name)
+        if not cls._sameFolder(folder, cls.publishedModelFolder()) and isCompleteModelFile(cached, entry["size"]):
+            if report is not None:
+                report(f"Copying {name} from the downloaded models…")
+            cls.copyFile(cached, destination)
+            return True
+        cls.downloadFile(entry["url"], destination, expectedSize=entry.get("size"), sha256=entry.get("sha256"),
+                         report=report, text=f"Downloading {name} from GitHub…")
+        return False
+
+    @classmethod
+    def fetchSidecar(cls, entry, folder, cachedFirst=False):
+        """Published model's .txt into folder (from the shared cache folder if cachedFirst). Path, or None."""
+        name = sidecarName(entry["name"])
+        destination = os.path.join(folder, name)
+        cached = os.path.join(cls.publishedModelFolder(), name)
+        if cachedFirst and not cls._sameFolder(folder, cls.publishedModelFolder()) and os.path.isfile(cached):
+            return cls.copyFile(cached, destination)
+        if not entry.get("sidecarUrl"):
+            return None
+        return cls.downloadFile(entry["sidecarUrl"], destination)
 
     @staticmethod
     def chooseDevice(torch, forceCPU):
