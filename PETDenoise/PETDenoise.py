@@ -279,7 +279,7 @@ class PETDenoise(ScriptedLoadableModule):
         parent.contributors = ["Burak Demir, MD, FEBNM"]
         parent.helpText = "This module provides automated denoising of PET images with UNET / SwinUNETR neural networks."
         parent.acknowledgementText = "This file was developed by Burak Demir."
-        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "logo.png")
+        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "Icons", "PETDenoise.png")
         if os.path.exists(iconPath):
             parent.icon = qt.QIcon(iconPath)
 

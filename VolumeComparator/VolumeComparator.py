@@ -29,7 +29,7 @@ class VolumeComparator(ScriptedLoadableModule):
         parent.contributors = ["Burak Demir, MD, FEBNM"]
         parent.helpText = "This module provides comparison and loss metrics for two volumes."
         parent.acknowledgementText = "This file was developed by Burak Demir."
-        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "logo.png")
+        iconPath = os.path.join(os.path.dirname(__file__), "Resources", "Icons", "VolumeComparator.png")
         if os.path.exists(iconPath):
             parent.icon = qt.QIcon(iconPath)
 
