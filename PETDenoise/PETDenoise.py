@@ -288,10 +288,45 @@ class PETDenoise(ScriptedLoadableModule):
 # Widget
 # ---------------------------------------------------------------------------
 
+class _BannerLabel(qt.QLabel):
+    """The extension banner, as wide as the module panel (aspect ratio kept, sharp on scaled displays)."""
+
+    def __init__(self, path):
+        qt.QLabel.__init__(self)
+        self._pixmap = qt.QPixmap(path)
+        self._shownWidth = -1
+        self.setAlignment(qt.Qt.AlignCenter)
+        self.setSizePolicy(qt.QSizePolicy.Ignored, qt.QSizePolicy.Fixed)
+        self.setMinimumWidth(1)
+        self.setFixedHeight(120)
+
+    def resizeEvent(self, event):
+        qt.QLabel.resizeEvent(self, event)
+        width = self.contentsRect().width()
+        if width < 20 or width == self._shownWidth or self._pixmap.isNull():
+            return
+        self._shownWidth = width
+        try:
+            ratio = float(self.devicePixelRatioF())
+        except Exception:
+            ratio = 1.0
+        scaled = self._pixmap.scaledToWidth(int(round(width * ratio)), qt.Qt.SmoothTransformation)
+        try:
+            scaled.setDevicePixelRatio(ratio)
+        except Exception:
+            pass
+        self.setFixedHeight(int(round(scaled.height() / ratio)))
+        self.setPixmap(scaled)
+
+
 class PETDenoiseWidget(ScriptedLoadableModuleWidget):
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
+        # the extension banner at the top of the panel, as wide as the panel
+        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Images", "banner.jpg")
+        if os.path.exists(bannerPath):
+            self.layout.addWidget(_BannerLabel(bannerPath))
         self.logic = PETDenoiseLogic()
         self._running = False
 
@@ -372,14 +407,6 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
         self.calculateButton = qt.QPushButton("Denoise")
         self.calculateButton.toolTip = "Start the denoising process"
         formLayout.addRow(self.calculateButton)
-
-        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Images", "banner.jpg")
-        if os.path.exists(bannerPath):
-            bannerLabel = qt.QLabel()
-            bannerLabel.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(600, qt.Qt.SmoothTransformation))
-            bannerLabel.setAlignment(qt.Qt.AlignCenter)
-            self.layout.addWidget(bannerLabel)
-
 
         infoTextBox = qt.QTextEdit()
         infoTextBox.setReadOnly(True)

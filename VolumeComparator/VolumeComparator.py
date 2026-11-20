@@ -34,10 +34,47 @@ class VolumeComparator(ScriptedLoadableModule):
             parent.icon = qt.QIcon(iconPath)
 
 
+class _BannerLabel(qt.QLabel):
+    """The extension banner, as wide as the module panel (aspect ratio kept, sharp on scaled displays)."""
+
+    def __init__(self, path):
+        qt.QLabel.__init__(self)
+        self._pixmap = qt.QPixmap(path)
+        self._shownWidth = -1
+        self.setAlignment(qt.Qt.AlignCenter)
+        self.setSizePolicy(qt.QSizePolicy.Ignored, qt.QSizePolicy.Fixed)
+        self.setMinimumWidth(1)
+        self.setFixedHeight(120)
+
+    def resizeEvent(self, event):
+        qt.QLabel.resizeEvent(self, event)
+        width = self.contentsRect().width()
+        if width < 20 or width == self._shownWidth or self._pixmap.isNull():
+            return
+        self._shownWidth = width
+        try:
+            ratio = float(self.devicePixelRatioF())
+        except Exception:
+            ratio = 1.0
+        scaled = self._pixmap.scaledToWidth(int(round(width * ratio)), qt.Qt.SmoothTransformation)
+        try:
+            scaled.setDevicePixelRatio(ratio)
+        except Exception:
+            pass
+        self.setFixedHeight(int(round(scaled.height() / ratio)))
+        self.setPixmap(scaled)
+
+
 class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
+        # the extension banner at the top of the panel, as wide as the panel
+        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Images", "banner.jpg")
+        if not os.path.exists(bannerPath):   # the banner ships with the main module (PETDenoise)
+            bannerPath = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "PETDenoise", "Resources", "Images", "banner.jpg")
+        if os.path.exists(bannerPath):
+            self.layout.addWidget(_BannerLabel(bannerPath))
         self._running = False
 
 
@@ -78,17 +115,6 @@ class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
         self.calculateButton.connect("clicked(bool)", self.onCalculateButtonClicked)
         self.copyButton.connect("clicked(bool)", self.onCopyResults)
         self._lastCsv = ""
-
-        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Images", "banner.jpg")
-        if not os.path.exists(bannerPath):   # the banner ships with the main module (PETDenoise)
-            bannerPath = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "PETDenoise", "Resources", "Images", "banner.jpg")
-        if os.path.exists(bannerPath):
-            bannerLabel = qt.QLabel()
-            bannerLabel.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(600, qt.Qt.SmoothTransformation))
-            bannerLabel.setAlignment(qt.Qt.AlignCenter)
-            self.layout.addWidget(bannerLabel)
-
-
 
         infoTextBox = qt.QTextEdit()
         infoTextBox.setReadOnly(True)
