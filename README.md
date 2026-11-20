@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="Branding/Belenos_banner.jpg" alt="Belenos: PET Denoise" width="100%">
+</p>
+
 # SlicerPETDenoise Extension for 3D Slicer
 
 **Author**: Burak Demir, MD, FEBNM  
@@ -5,10 +9,6 @@
 **Contact**: 4burakfe@gmail.com
 
 ## Overview
-
-
-![Screenshot](PETDenoise/Resources/banner.png)
-
 
 SlicerPETDenoise is a 3D Slicer extension with two modules for medical image research, particularly PET and CT workflows. They assist in denoising and comparing volumetric data. The tools are developed with research utility in mind and are **not intended for clinical use**.
 

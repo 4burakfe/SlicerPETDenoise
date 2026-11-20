@@ -373,7 +373,7 @@ class PETDenoiseWidget(ScriptedLoadableModuleWidget):
         self.calculateButton.toolTip = "Start the denoising process"
         formLayout.addRow(self.calculateButton)
 
-        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "banner.png")
+        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Images", "banner.jpg")
         if os.path.exists(bannerPath):
             bannerLabel = qt.QLabel()
             bannerLabel.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(600, qt.Qt.SmoothTransformation))

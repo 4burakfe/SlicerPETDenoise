@@ -79,7 +79,9 @@ class VolumeComparatorWidget(ScriptedLoadableModuleWidget):
         self.copyButton.connect("clicked(bool)", self.onCopyResults)
         self._lastCsv = ""
 
-        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "banner.png")
+        bannerPath = os.path.join(os.path.dirname(__file__), "Resources", "Images", "banner.jpg")
+        if not os.path.exists(bannerPath):   # the banner ships with the main module (PETDenoise)
+            bannerPath = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "PETDenoise", "Resources", "Images", "banner.jpg")
         if os.path.exists(bannerPath):
             bannerLabel = qt.QLabel()
             bannerLabel.setPixmap(qt.QPixmap(bannerPath).scaledToWidth(600, qt.Qt.SmoothTransformation))
